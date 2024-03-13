@@ -1,0 +1,288 @@
+/* ----------------------------------------------------------------------
+   LAMMPS - Large-scale Atomic/Molecular Massively Parallel Simulator
+   https://www.lammps.org/, Sandia National Laboratories
+   Steve Plimpton, sjplimp@sandia.gov
+
+   Copyright (2003) Sandia Corporation.  Under the terms of Contract
+   DE-AC04-94AL85000 with Sandia Corporation, the U.S. Government retains
+   certain rights in this software.  This software is distributed under
+   the GNU General Public License.
+
+   See the README file in the top-level LAMMPS directory.
+------------------------------------------------------------------------- */
+
+#include "fix_cellproli.h"
+#include "delaunay.h"
+
+#include "arg_info.h"
+#include "atom.h"
+#include "atom_masks.h"
+#include "atom_vec.h"
+#include "cell.hh"
+#include "comm.h"
+#include "compute.h"
+#include "domain.h"
+#include "error.h"
+#include "group.h"
+#include "input.h"
+#include "math_const.h"
+#include "math_extra.h"
+#include "memory.h"
+#include "modify.h"
+#include "random_mars.h"
+#include "region.h"
+#include "respa.h"
+#include "update.h"
+#include "variable.h"
+
+#include <cstring>
+#include <cstdlib>
+#include <cstdio>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string>
+#include <iostream>
+#include <fstream>
+#include <cmath>
+#include <math.h>
+#include <vector>
+#include <bits/stdc++.h>
+#include <random>
+#include <algorithm>
+
+using namespace LAMMPS_NS;
+using namespace FixConst;
+using namespace MathConst;
+using namespace std;
+using namespace voro;
+
+enum {ATOM};
+
+/* ---------------------------------------------------------------------- */
+
+FixCellProli::FixCellProli(LAMMPS *lmp, int narg, char **arg):
+    Fix(lmp, narg, arg), id_compute_voronoi(nullptr), voro_area(nullptr), voro_peri(nullptr),
+    idregion(nullptr), region(nullptr), list(nullptr), mark(nullptr)
+{
+  if (narg < 7) error->all(FLERR, "Illegal fix voronoiforce command: not sufficient args");
+
+  MPI_Comm_rank(world, &me);
+  MPI_Comm_size(world, &nprocs);
+
+  Ar_apop = utils::numeric(FLERR, arg[3], false, lmp);
+  Ar_div = utils::numeric(FLERR, arg[4], false, lmp);
+  Ex_rate = utils::numeric(FLERR, arg[5], false, lmp);
+
+  /*This fix takes in input as per-atom array
+  produced by compute voronoi*/
+
+  id_compute_voronoi = utils::strdup(arg[6]);
+  vcompute = modify->get_compute_by_id(id_compute_voronoi);
+  if (!vcompute)
+    error->all(FLERR, "Could not find compute ID {} for voronoi compute", id_compute_voronoi);
+
+  //parse values for optional arguments
+  /*May be used for future cell proliferation*/
+
+  nevery = 1;    // Using default value for now
+
+  /*Read region if required*/
+
+  if (narg > 7) {
+    idregion = utils::strdup(arg[10]);
+    region = domain->get_region_by_id(idregion);
+  }
+
+  maxatom = 1;    //previously atom->nmax
+  memory->create(voro_area, maxatom, "voronoiforce:voro_area");
+  memory->create(voro_peri, maxatom, "voronoiforce:voro_peri");
+
+  // set up reneighboring
+
+  force_reneighbor = 1;    //this flag is important for invoking pre-exchange
+  next_reneighbor = (update->ntimestep / nevery) * nevery + nevery;
+
+  nmax = 0;
+  list = nullptr;
+  mark = nullptr;
+}
+
+/* ---------------------------------------------------------------------- */
+
+FixCellProli::~FixCellProli()
+{
+  delete[] id_compute_voronoi;
+  delete[] idregion;
+  delete wgn;
+ 
+  memory->destroy(voro_area);
+  memory->destroy(voro_peri);
+  memory->destroy(mark);
+  memory->destroy(list);
+  
+  // fclose(fp);
+}
+
+/* ---------------------------------------------------------------------- */
+// returntype classname :: functidentifier(args) }
+
+int FixCellProli::setmask()
+{
+  int mask = 0;
+  mask |= PRE_EXCHANGE;
+  return mask;
+}
+
+/* ---------------------------------------------------------------------- */
+
+void FixCellProli::init()
+{
+  // set indices and check validity of all computes and variables
+
+  // set index and check validity of region
+ 
+  /*For future when we include nevery and region ids*/
+  // if (idregion) {
+  //   region = domain->get_region_by_id(idregion);
+  //   if (!region) error->all(FLERR, "Region {} for fix voronoiforce does not exist", idregion);
+  // }
+
+    if (id_compute_voronoi) {
+      vcompute = modify->get_compute_by_id(id_compute_voronoi);
+      if (!vcompute) error->all(FLERR,"Could not find compute ID {} for fix cellproli", id_compute_voronoi);
+  }
+
+}
+
+/* ---------------------------------------------------------------------- */
+
+/* ---------------------------------------------------------------------- */
+
+void FixCellProli::setup_pre_exchange()
+{
+  // if (ninserted < ninsert) next_reneighbor = nfirst + ((update->ntimestep - nfirst)/nfreq)*nfreq + nfreq;
+  // else next_reneighbor = 0;
+}
+
+
+/*-------------Add pre-exchange method--------------------------*/
+
+// Only create an delete particles
+// Look for fix deposit and fix evaporate
+
+void FixCellProli::pre_exchange()
+{
+  next_reneighbor = update->ntimestep+nevery;  //This makes sure that the flag neighbor:decide() is activated
+
+
+  //resize array to store voronoi data
+
+    if (atom->nmax > maxatom) {
+    memory->destroy(voro_area);
+    memory->destroy(voro_peri);
+    maxatom = atom->nmax;
+    memory->create(voro_area, maxatom, "voronoiforce:voro_area");
+    memory->create(voro_peri, maxatom, "voronoiforce:voro_peri");
+  }
+
+
+  // grow list and mark arrays if necessary (from fix evaporate)
+
+  if (atom->nmax > nmax) {
+    memory->destroy(list);
+    memory->destroy(mark);
+    nmax = atom->nmax;
+    memory->create(list, nmax, "evaporate:list");
+    memory->create(mark, nmax, "evaporate:mark");
+  }
+
+  int *mask = atom->mask;
+  int nlocal = atom->nlocal;
+  double *cell_area = new double[nlocal];
+  //Initialise the array:
+  for (int i = 0; i < nlocal; i++){
+    cell_area[i] = 0.0;
+  }
+
+   // Invoke compute
+  modify->clearstep_compute();
+  vcompute = modify->get_compute_by_id(id_compute_voronoi);
+  if (!(vcompute->invoked_flag & Compute::INVOKED_PERATOM)) {
+    vcompute->compute_peratom();
+    vcompute->invoked_flag |= Compute::INVOKED_PERATOM;
+  }
+
+  // define a vector that would store the local ids to be deleted
+  // Fill voro_data with values from compute voronoi
+  for (int i = 0; i < nlocal; i++) {
+    if (mask[i] & groupbit){
+      cell_area[i] = vcompute->array_atom[i][0];
+      if (cell_area[i] < Ar_apop){
+        int a = 10;
+      }
+    } 
+  }
+
+  // release the memory once you are done
+  delete[] cell_area;
+  cell_area = nullptr;
+
+}
+
+/* ---------------------------------------------------------------------- */
+
+/*------------------------------------------------------------------------*/
+
+int FixCellProli::pack_forward_comm(int n, int *list, double *buf,
+                                    int /*pbc_flag*/, int * /*pbc*/)
+
+{
+  int i,j,k,m;
+
+  m = 0;
+
+ if(commflag == 1){
+    for(i = 0; i < n; i++){
+      j = list[i];
+      buf[m++] = voro_area[j];
+    }
+  }
+  else if(commflag == 2){
+    for(i = 0; i < n; i++){
+      j = list[i];
+      buf[m++] = voro_peri[j];
+    }
+  }
+  return m;
+}
+
+void FixCellProli::unpack_forward_comm(int n, int first, double *buf)
+{
+  int i,j,m,last;
+
+  m = 0;
+  last = first + n;
+
+ if (commflag == 1) {
+        for (i = first; i < last; i++){
+      voro_area[i] = buf[m++];
+    }
+  }
+      else if (commflag == 2) {
+        for (i = first; i < last; i++){
+      voro_peri[i] = buf[m++];
+    }
+  }
+}
+
+/* ----------------------------------------------------------------------
+   memory usage of local atom-based arrays
+------------------------------------------------------------------------- */
+
+// double FixCellProli::memory_usage()
+// {
+//   double bytes = maxatom *4 * sizeof(double);
+//   return bytes;
+// }
+
+
