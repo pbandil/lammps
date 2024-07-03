@@ -62,7 +62,7 @@ FixSpvForce::FixSpvForce(LAMMPS *lmp, int narg, char **arg) :
     Fix(lmp, narg, arg), id_compute_voronoi(nullptr), voro_area(nullptr), voro_peri(nullptr),
     def_voro_peri(nullptr), wgn(nullptr), idregion(nullptr), region(nullptr)
 {
-  if (narg < 17) error->all(FLERR, "Illegal fix spvforce command: not sufficient args");
+  if (narg < 13) error->all(FLERR, "Illegal fix spvforce command: not sufficient args");
 
   MPI_Comm_rank(world, &me);
   MPI_Comm_size(world, &nprocs);
@@ -83,25 +83,19 @@ FixSpvForce::FixSpvForce(LAMMPS *lmp, int narg, char **arg) :
 
   // Read the simulation parameters
 
-  Kappa = utils::numeric(FLERR, arg[3], false, lmp);
-  Apref = utils::numeric(FLERR, arg[4], false, lmp);
-  Gamma = utils::numeric(FLERR, arg[5], false, lmp);
-  Lambda = utils::numeric(FLERR, arg[6], false, lmp);
-  alpha = utils::numeric(FLERR, arg[7], false, lmp);
-  ngx = utils::numeric(FLERR, arg[8], false, lmp);
-  id_compute_voronoi = utils::strdup(arg[9]);
+  ka = utils::numeric(FLERR, arg[3], false, lmp);
+  kp = utils::numeric(FLERR, arg[4], false, lmp);
+  p0 = utils::numeric(FLERR, arg[5], false, lmp);
+  id_compute_voronoi = utils::strdup(arg[6]);
 
+  fa = utils::numeric(FLERR, arg[7], false, lmp);
+  Js = utils::numeric(FLERR, arg[8], false, lmp);
+  Jn = utils::numeric(FLERR, arg[9], false, lmp);
   Jv = utils::numeric(FLERR, arg[10], false, lmp);
-  Jn = utils::numeric(FLERR, arg[11], false, lmp);
-  Js = utils::numeric(FLERR, arg[12], false, lmp);
-  fa = utils::numeric(FLERR, arg[13], false, lmp);
-  var = utils::numeric(FLERR, arg[14], false, lmp);
-  gamma_R = utils::numeric(FLERR, arg[15], false, lmp);
 
-  F11 = utils::numeric(FLERR, arg[16], false, lmp);
-  F12 = 0.0;
-
-
+  var = utils::numeric(FLERR, arg[11], false, lmp);
+  F11 = utils::numeric(FLERR, arg[12], false, lmp);
+ 
   /*This fix takes in input as per-atom array
   produced by compute voronoi*/
 
@@ -114,7 +108,7 @@ FixSpvForce::FixSpvForce(LAMMPS *lmp, int narg, char **arg) :
 
   nevery = 1;    // Using default value for now
 
-  if (narg > 17) {
+  if (narg > 13) {
     idregion = utils::strdup(arg[17]);
     region = domain->get_region_by_id(idregion);
   }
@@ -123,6 +117,8 @@ FixSpvForce::FixSpvForce(LAMMPS *lmp, int narg, char **arg) :
   memory->create(voro_area, maxatom, "spvforce:voro_area");
   memory->create(voro_peri, maxatom, "spvforce:voro_peri");
   memory->create(def_voro_peri, maxatom, "spvforce:def_voro_peri");
+
+  initflag = 0;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -147,10 +143,10 @@ FixSpvForce::~FixSpvForce()
 
 void FixSpvForce::post_constructor()
 {
-
   // this is all just to make initial space
-
- // this is all just to make initial space
+  
+  //Debugger
+  printf("<--------------called at run---------->");
 
   new_fix_id = utils::strdup(id + std::string("_FIX_PA")); // This is the name of the new fix property/atom
   modify->add_fix(fmt::format("{} {} property/atom d2_pol 2 ghost yes",new_fix_id, group->names[igroup]));
@@ -159,8 +155,8 @@ void FixSpvForce::post_constructor()
 
   int tmp1, tmp2;
   index = atom->find_custom("pol",tmp1,tmp2);
-
   double **pol = atom->darray[index];   //Note that it is a 2D array
+  
   int *mask = atom->mask;
   int nlocal = atom->nlocal;
   int nghost = atom->nghost;
@@ -197,9 +193,16 @@ void FixSpvForce::init()
 {
   // set indices and check validity of all computes and variables
 
-  // set index and check validity of region
+  if(initflag) return;
+  initflag = 1;                 //This will ensure that init function only called at the start of simulation
 
-  /*For future when we include nevery and region ids*/
+  xlo_init = domain->boxlo[0];
+  ylo_init = domain->boxlo[1];
+  xhi_init = domain->boxhi[0];
+  yhi_init = domain->boxhi[1];
+  //printf("%f  %f  %f  %f in init\n ", xlo_init, ylo_init, xhi_init, yhi_init);
+
+  // set index and check validity of region
   if (idregion) {
     region = domain->get_region_by_id(idregion);
     if (!region) error->all(FLERR, "Region {} for fix spvforce does not exist", idregion);
@@ -487,11 +490,12 @@ void Jacobian(double **x, vector<int> &dt, int p, double drnu_dRi[][3], double F
   Jac[2][1] = ri[2] * d1[1] + rj[2] * d2[1] + rk[2] * d3[1];
   Jac[2][2] = ri[2] * d1[2] + lam1 / clam + rj[2] * d2[2] + rk[2] * d3[2];
 
-  //Find the gradient wrt underformed cell center
+  //jacobi does not change because of deformation Fe as bot ri and rnu get deformed as per the same Fe
 
   for (int I = 0; I < 3; I++) {
     for (int J = 0; J < 3; J++) {
-      drnu_dRi[I][J] = F[I][0]*Jac[0][J] + F[I][1]*Jac[1][J] + F[I][2]*Jac[2][J];
+      //drnu_dRi[I][J] = F[I][0]*Jac[0][J] + F[I][1]*Jac[1][J] + F[I][2]*Jac[2][J];
+      drnu_dRi[I][J] = Jac[I][J];
     }
   }
   //printf("Jacobian: %f --> %f -->%f -->%f \n", Jac[0][0], Jac[0][1], Jac[1][0], Jac[1][1]);
@@ -583,7 +587,7 @@ void FixSpvForce::post_force(int vflag)
 
   /*Once you have voronoi information: identift atoms to delete in the next time step*/
 
-  // forward communication of voronoi data:
+  // forward communication of voronoi area:
 
   commflag = 1;
   comm->forward_comm(this, 1);
@@ -591,7 +595,7 @@ void FixSpvForce::post_force(int vflag)
   // commflag = 2;
   // comm->forward_comm(this, 1);
 
-   /*Construct Delaunay Triangulation for a set of nall points using Bowyer Watson Algorithm*/
+  /*Construct Delaunay Triangulation for a set of nall points using Bowyer Watson Algorithm*/
 
  //declare dynamic containers to store details of Delaunay Triangulation
 
@@ -719,24 +723,37 @@ void FixSpvForce::post_force(int vflag)
       cell_neighs_list[i].push_back(i);  // to add force contribution from the cell itself
   }
 
-  /*Once you have Delaunay in undeformed config: find Lij i.e. the junction vector for each each junction*/
+  /*Once you have Delaunay in natural config: find Lij i.e. the junction vector for each each junction*/
 
-   double defGrad[3][3] = {0.0};
-   int curr_step = update->ntimestep;
-   int nsteps = update->nsteps;
+  //Find inelastic def applied by fix_deform:
 
-   if (curr_step <= nsteps){
-    defGrad[0][0] = curr_step*(F11-1.0)/nsteps + 1.0;
-    //printf("curr_step = %d, def grad F1e = %f, totoal step = %d \n", curr_step, defGrad[0][0], nsteps);
-   }
-   else{
-    defGrad[0][0] = F11;
-    //printf("def grad 2nd part is: %f at current step %d\n", defGrad[0][0], curr_step);
-   }
+ double defGrad[3][3] = {0.0}; //this is elastic deformation, hence inverse of F applied by fix _deform
+
+  xlo_curr = domain->boxlo[0];
+  ylo_curr = domain->boxlo[1];
+  xhi_curr = domain->boxhi[0];
+  yhi_curr = domain->boxhi[1];
+
+  FiX = (xhi_curr-xlo_curr)/(xhi_init-xlo_init);
+  FiY = (yhi_curr-ylo_curr)/(yhi_init-ylo_init);
+
+  //int curr_step = update->ntimestep;
+  //int nsteps = update->nsteps;
+
+  //  if (curr_step <= nsteps){
+  //   defGrad[0][0] = curr_step*(F11-1.0)/nsteps + 1.0;
+  //   //printf("curr_step = %d, def grad F1e = %f, totoal step = %d \n", curr_step, defGrad[0][0], nsteps);
+  //  }
+  //  else{
+  //   defGrad[0][0] = F11;
+  //   //printf("def grad 2nd part is: %f at current step %d\n", defGrad[0][0], curr_step);
+  //  }
    
-   defGrad[0][1] = F12;
-   defGrad[1][1] = 1.0/defGrad[0][0];
-   defGrad[2][2] = 1.0;
+   defGrad[0][0] = 1.0 / FiX;
+   defGrad[1][1] = 1.0 / defGrad[0][0];
+   defGrad[2][2] = 1.0;           //for the Z dimension
+
+   //printf("def grad at time step %d is Fx= %f,  Fy= %f\n",update->nsteps, defGrad[0][0], defGrad[1][1]);
   
    vector<vector<double>> Del_Tri_cc_def;  //declare new vector to store 
    Del_Tri_cc_def = Del_Tri_cc;
@@ -776,20 +793,11 @@ void FixSpvForce::post_force(int vflag)
 
   /*First do Voronoi Force Calculation*/ 
 
-  double ngy = sqrt(1 - ngx * ngx);    // y component of groove direction
-  double alph_jun;
-
   for (int i = 0; i < nlocal; i++) {
     if (mask[i] & groupbit) {
-      if (region && !region->match(x[i][0], x[i][1], x[i][2])) {
-        alph_jun = 0.0;
-      } else {
-        alph_jun = alpha;
-      }
 
       double F_t1[3] = {0.0};
       double F_t2[3] = {0.0};
-      double F_t3[3] = {0.0};
 
       for (int j = 0; j < cell_neighs_list[i].size(); j++) {
         int current_cell = cell_neighs_list[i][j];
@@ -798,13 +806,13 @@ void FixSpvForce::post_force(int vflag)
         double vertex_force_sum_t3[3] = {0.0};
 
         // First term values needed
-        double area = voro_area[current_cell];
-        double elasticity_area = (Kappa / 2.0) * (area - Apref);
+        double ai = voro_area[current_cell];
+        double elasticity_area = (ka / 2.0) * (ai - 1);
 
         // Second term values needed
         //double perimeter = voro_peri[current_cell] - 2 * area;
-        double perimeter = def_voro_peri[current_cell];
-        double gamma_perimeter = Gamma * (perimeter);
+        double pi = def_voro_peri[current_cell];
+        double elasticity_peri = kp * (pi - p0);
 
         int num_vert = cell_vertices_list[current_cell].size();
         int vcount = 0;
@@ -847,24 +855,11 @@ void FixSpvForce::post_force(int vflag)
             normalize(rnextcurr);
             double rhatdiff_t2[3] = {rcurrprev[0] - rnextcurr[0], rcurrprev[1] - rnextcurr[1], 0.0};
 
-            // Third term stuff
-
-            // Find the angle between edge rcurrprev, rnextcurr and groove direction
-            double s2th_curr_prev = 1 - pow(rcurrprev[0] * ngx + rcurrprev[1] * ngy, 2.0);
-            double s2th_next_curr = 1 - pow(rnextcurr[0] * ngx + rnextcurr[1] * ngy, 2.0) - 1;
-            double Lam_curr_prev = Lambda * (1 + alph_jun * s2th_curr_prev);
-            double Lam_next_curr = Lambda * (1 + alph_jun * s2th_next_curr);
-
-            double rhatdiff_t3[3] = {Lam_curr_prev * rcurrprev[0] - Lam_next_curr * rnextcurr[0],
-                                     Lam_curr_prev * rcurrprev[1] - Lam_next_curr * rnextcurr[1],
-                                     0.0};
-
             double drnu_dRi[3][3] = {0.0};
             Jacobian(x, Del_Tri_mesh[current_vert], i, drnu_dRi, defGrad);
 
             double result_t1[3] = {0};
             double result_t2[3] = {0};
-            double result_t3[3] = {0};
 
             // Term 1 forces
             vector_matrix(result_t1, cp, drnu_dRi);
@@ -877,12 +872,6 @@ void FixSpvForce::post_force(int vflag)
             vertex_force_sum_t2[0] += result_t2[0];
             vertex_force_sum_t2[1] += result_t2[1];
             vertex_force_sum_t2[2] += result_t2[2];
-
-            // Term 3 forces
-            vector_matrix(result_t3, rhatdiff_t3, drnu_dRi);
-            vertex_force_sum_t3[0] += result_t3[0];
-            vertex_force_sum_t3[1] += result_t3[1];
-            vertex_force_sum_t3[2] += result_t3[2];
           }
           vcount++;
         }
@@ -890,24 +879,21 @@ void FixSpvForce::post_force(int vflag)
         F_t1[1] += elasticity_area * vertex_force_sum_t1[1];
         F_t1[2] += elasticity_area * vertex_force_sum_t1[2];
 
-        F_t2[0] += gamma_perimeter * vertex_force_sum_t2[0];
-        F_t2[1] += gamma_perimeter * vertex_force_sum_t2[1];
-        F_t2[2] += gamma_perimeter * vertex_force_sum_t2[2];
-
-        F_t3[0] += vertex_force_sum_t3[0];
-        F_t3[1] += vertex_force_sum_t3[1];
-        F_t3[2] += vertex_force_sum_t3[2];
+        F_t2[0] += elasticity_peri * vertex_force_sum_t2[0];
+        F_t2[1] += elasticity_peri * vertex_force_sum_t2[1];
+        F_t2[2] += elasticity_peri * vertex_force_sum_t2[2];
       }
-      double fx = -F_t1[0] - F_t2[0] - F_t3[0];
-      double fy = -F_t1[1] - F_t2[1] - F_t3[1];
-      double fz = -F_t1[2] - F_t2[2] - F_t3[2];
+      double fx = -F_t1[0] - F_t2[0];
+      double fy = -F_t1[1] - F_t2[1];
+      double fz = -F_t1[2] - F_t2[2];
       f[i][0] += fx;
       f[i][1] += fy;
       f[i][2] += fz;
     }
+    //printf("force on cell %d is %f...%f...%f\n", tag[i], f[i][0], f[i][1], f[i][2]);
   }
 
-  /*Now perform force calculation for self-propelled forces*/
+ /*Now perform force calculation for self-propelled forces*/
 
   int tmp1, tmp2;
   index = atom->find_custom("pol", tmp1, tmp2);
@@ -970,6 +956,7 @@ void FixSpvForce::post_force(int vflag)
 
   double dThetadt, dthdt_vel, dthdt_shp, dthdt_ngh;
   double tau;
+  gamma_R = 1.0;
 
   for (int i = 0; i < nlocal; i++) {
 
