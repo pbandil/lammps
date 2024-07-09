@@ -59,7 +59,6 @@ class FixTriDynamic : public Fix {
  private:
 
   int neighs_MAX;
-  double KT = 1;
 
   //Voronoi Force Data members
   class Compute *vcompute;    // To read data from compute voronoi (only for initialization)
@@ -70,7 +69,7 @@ class FixTriDynamic : public Fix {
 
   //Force calculation: self prpelled dynamic triangulation forces
   double kp, p0;
-  double Jv, Jn, Js, fa, var, gamma_R;
+  double Jv, Jn, Js, fa, var, gamma_R, KT;
 
   class RanMars *wgn;
   int seed_wgn;
@@ -109,6 +108,10 @@ class FixTriDynamic : public Fix {
 
   void print_neighs_list(tagint *, int, tagint);
 
+  bool isConcave(double *, double *, double *, double *);
+  double crossProduct(double *, double *, double *);
+  void getCP(double *, double *, double *);
+  void normalize(double *);
 
   //vector<vector<int>> find_triangles(tagint **, int);
 };

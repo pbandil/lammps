@@ -63,7 +63,7 @@ FixTriDynamic::FixTriDynamic(LAMMPS *lmp, int narg, char **arg) :
     Fix(lmp, narg, arg), id_compute_voronoi(nullptr), cell_shape(nullptr), wgn(nullptr),
     idregion(nullptr), region(nullptr)
 {
-  if (narg < 13) error->all(FLERR, "Illegal fix TriDynamic command: not sufficient args");
+  if (narg < 14) error->all(FLERR, "Illegal fix TriDynamic command: not sufficient args");
 
   MPI_Comm_rank(world, &me);
   MPI_Comm_size(world, &nprocs);
@@ -93,6 +93,7 @@ FixTriDynamic::FixTriDynamic(LAMMPS *lmp, int narg, char **arg) :
   var = utils::numeric(FLERR, arg[10], false, lmp);
   neighs_MAX = utils::numeric(FLERR, arg[11], false, lmp);
   gamma_R = utils::numeric(FLERR, arg[12], false, lmp);
+  KT = utils::numeric(FLERR, arg[13], false, lmp);
 
   /*This fix takes in input as per-atom array
   produced by compute voronoi*/
@@ -104,8 +105,8 @@ FixTriDynamic::FixTriDynamic(LAMMPS *lmp, int narg, char **arg) :
   //parse values for optional arguments
   nevery = 1;    // Using default value for now
 
-  if (narg > 13) {
-    idregion = utils::strdup(arg[13]);
+  if (narg > 14) {
+    idregion = utils::strdup(arg[14]);
     region = domain->get_region_by_id(idregion);
   }
 
@@ -393,11 +394,242 @@ void FixTriDynamic::post_force(int vflag)
     get_cell_data(array_atom[i], cell_shape[i], neighs[i], num_neighs[i], i);
   }
 
+  // //DEBUGGER
+  // for (int i = 0; i < nlocal; i++){
+  //   printf("vertices for cell %d--> ", tag[i]);
+  //   for (int j = 0; j < neighs_MAX*2; j++){
+  //     printf("%f, ", array_atom[i][j]);
+  //   }
+  //   printf("\n\n");
+  // }
+  // //DEBUGGER
+
   //forward communicate the cell shape data
   commflag = 1;
   comm->forward_comm(this, 3);
 
-  /****STEP 4: Implement monte-carlo algorithm to update the network topology****/
+  /****: Do the force calculation based on current toplogy****/
+
+  double Jac = 1.0 / 3.0;
+
+  for (int i = 0; i < nlocal; i++) {
+    if (mask[i] & groupbit) {
+
+      //corrds of cell i
+      double x0 = x[i][0];
+      double y0 = x[i][1];
+
+      double F_t1[2] = {0.0};
+      double F_t2[2] = {0.0};
+
+      //Force contri from neighs
+      for (int j = 0; j < num_neighs[i]; j++) {
+
+        int current_cell = domain->closest_image(i, atom->map(neighs[i][j]));   
+
+        //coords of cell j
+        double x1 = x[current_cell][0];
+        double y1 = x[current_cell][1];
+
+        int num_neighsj = num_neighs[current_cell];
+
+        int cyclic_neighsj[num_neighsj+4];
+
+        cyclic_neighsj[0] = neighs[current_cell][num_neighsj-2];
+        cyclic_neighsj[1] = neighs[current_cell][num_neighsj-1];
+
+        for (int n = 2; n < num_neighsj+2; n++){
+          cyclic_neighsj[n] = neighs[current_cell][n-2];
+        }
+
+        cyclic_neighsj[num_neighsj+2] = neighs[current_cell][0];
+        cyclic_neighsj[num_neighsj+3] = neighs[current_cell][1];
+
+        // First term values needed
+        double ai = cell_shape[current_cell][0];
+        double elasticity_area = (1 / 2.0) * (ai - 1);
+
+        // Second term values needed
+        double pi = cell_shape[current_cell][1];
+        double elasticity_peri = kp * (pi - p0);
+
+        /*Now there are 2 vertices shared by cell i and j*/
+        //Find those two vertices:
+
+        int DT[2][3];    //each row is a triangle (local ids) and hence a vertex
+        DT[0][0] = i;
+        DT[1][0] = i;
+        DT[0][1] = current_cell;
+        DT[1][1] = current_cell;
+        int tri_prev[2][3]; 
+        int tri_next[2][3];
+
+        for (int n = 2; n < num_neighsj + 2; n++) {
+          if (cyclic_neighsj[n] == tag[i]) {
+            DT[0][2] = domain->closest_image(current_cell, atom->map(cyclic_neighsj[n - 1]));
+            tri_prev[0][0] = current_cell;
+            tri_prev[0][1] = DT[0][2];
+            tri_prev[0][2] = domain->closest_image(current_cell, atom->map(cyclic_neighsj[n - 2]));
+
+            tri_next[0][0] = current_cell;
+            tri_next[0][1] = i;
+            tri_next[0][2] = domain->closest_image(current_cell, atom->map(cyclic_neighsj[n + 1]));
+
+            DT[1][2] = domain->closest_image(current_cell, atom->map(cyclic_neighsj[n + 1]));
+            tri_prev[1][0] = current_cell;
+            tri_prev[1][1] = i;
+            tri_prev[1][2] = domain->closest_image(current_cell, atom->map(cyclic_neighsj[n - 1]));
+
+            tri_next[1][0] = current_cell;
+            tri_next[1][1] = DT[1][2];
+            tri_next[1][2] = domain->closest_image(current_cell, atom->map(cyclic_neighsj[n + 2]));
+            break;
+          }
+        }
+
+        double vertex_force_sum_t1[2] = {0.0};
+        double vertex_force_sum_t2[2] = {0.0};
+
+        //Now loop through both the vertices
+
+        for (int nu = 0; nu < 2; nu++) {
+
+          //Coords of cell k
+          double x2 = x[DT[nu][2]][0];
+          double y2 = x[DT[nu][2]][1];
+          
+          //Coords of the vertex
+          double vert[2] = {0.0};
+          vert[0] = (x0 + x1 + x2) / 3.0;
+          vert[1] = (y0 + y1 + y2) / 3.0;
+
+          /*Find coords of vert_next and vert_prev*/
+
+          //Next and prev vertices for neighboring atom j
+          double vert_prev[2] = {0.0};
+          vert_prev[0] = (x[tri_prev[nu][0]][0] + x[tri_prev[nu][1]][0] + x[tri_prev[nu][2]][0]) / 3.0; 
+          vert_prev[1] = (x[tri_prev[nu][0]][1] + x[tri_prev[nu][1]][1] + x[tri_prev[nu][2]][1]) / 3.0;
+
+          double vert_next[2] = {0.0};
+          vert_next[0] = (x[tri_next[nu][0]][0] + x[tri_next[nu][1]][0] + x[tri_next[nu][2]][0]) / 3.0;
+          vert_next[1] = (x[tri_next[nu][0]][1] + x[tri_next[nu][1]][1] + x[tri_next[nu][2]][1]) / 3.0;
+
+          //first term stuff
+
+          double rprevnext[3] = {vert_next[0] - vert_prev[0], vert_next[1] - vert_prev[1], 0.0};
+          double cp[3] = {0.0};
+          double N[3] = {0, 0, 1};    // normal vector to the plane of cell layer (2D)
+          getCP(cp, rprevnext, N);
+
+          //second term stuff
+          double rcurrprev[2] = {vert[0] - vert_prev[0], vert[1] - vert_prev[1]};
+          double rnextcurr[2] = {vert_next[0] - vert[0], vert_next[1] - vert[1]};
+          normalize(rcurrprev);
+          normalize(rnextcurr);
+          double rhatdiff_t2[2] = {rcurrprev[0] - rnextcurr[0], rcurrprev[1] - rnextcurr[1]};
+
+          // Term 1 forces
+          vertex_force_sum_t1[0] += cp[0] * Jac;
+          vertex_force_sum_t1[1] += cp[1] * Jac;
+
+          // Term 2 forces
+          vertex_force_sum_t2[0] += rhatdiff_t2[0] * Jac;
+          vertex_force_sum_t2[1] += rhatdiff_t2[1] * Jac;
+        }
+
+        F_t1[0] += elasticity_area * vertex_force_sum_t1[0];
+        F_t1[1] += elasticity_area * vertex_force_sum_t1[1];
+        F_t2[0] += elasticity_peri * vertex_force_sum_t2[0];
+        F_t2[1] += elasticity_peri * vertex_force_sum_t2[1];
+      }
+
+      /*Force contribution from self*/
+
+      double vertex_force_sum_t1[2] = {0.0};
+      double vertex_force_sum_t2[2] = {0.0};
+
+      // First term values needed
+      double ai = cell_shape[i][0];
+      double elasticity_area = (1 / 2.0) * (ai - 1);
+
+      // Second term values needed
+      double pi = cell_shape[i][1];
+      double elasticity_peri = kp * (pi - p0);
+
+      //Find vertices of cell i
+      double vertices_i_x[num_neighs[i]] = {0.0};
+      double vertices_i_y[num_neighs[i]] = {0.0};
+
+      for (int n = 0; n < num_neighs[i]; n++) {
+        vertices_i_x[n] = array_atom[i][2 * n];
+        vertices_i_y[n] = array_atom[i][2 * n + 1];
+      }
+
+      //Loop through the vertices
+
+      for (int nu = 0; nu < num_neighs[i]; nu++) {
+        double vert[2] = {0.0};
+        double vert_next[2] = {0.0};
+        double vert_prev[2] = {0.0};
+
+        vert[0] = array_atom[i][2 * nu];
+        vert[1] = array_atom[i][2 * nu + 1];
+
+        if (nu == 0) {
+          vert_next[0] = array_atom[i][2 * (nu + 1)];
+          vert_next[1] = array_atom[i][2 * (nu + 1) + 1];
+          vert_prev[0] = array_atom[i][2 * (num_neighs[i] - 1)];
+          vert_prev[1] = array_atom[i][2 * (num_neighs[i] - 1) + 1];
+        } else if (nu == num_neighs[i] - 1) {
+          vert_next[0] = array_atom[i][0];
+          vert_next[1] = array_atom[i][1];
+          vert_prev[0] = array_atom[i][2 * (nu - 1)];
+          vert_prev[1] = array_atom[i][2 * (nu - 1) + 1];
+        } else {
+          vert_next[0] = array_atom[i][2 * (nu + 1)];
+          vert_next[1] = array_atom[i][2 * (nu + 1) + 1];
+          vert_prev[0] = array_atom[i][2 * (nu - 1)];
+          vert_prev[1] = array_atom[i][2 * (nu - 1) + 1];
+        }
+
+        //first term stuff
+        double rprevnext[3] = {vert_next[0] - vert_prev[0], vert_next[1] - vert_prev[1], 0.0};
+        double cp[3] = {0.0};
+        double N[3] = {0, 0, 1};    // normal vector to the plane of cell layer (2D)
+        getCP(cp, rprevnext, N);
+
+        //second term stuff
+        double rcurrprev[2] = {vert[0] - vert_prev[0], vert[1] - vert_prev[1]};
+        double rnextcurr[2] = {vert_next[0] - vert[0], vert_next[1] - vert[1]};
+        normalize(rcurrprev);
+        normalize(rnextcurr);
+        double rhatdiff_t2[2] = {rcurrprev[0] - rnextcurr[0], rcurrprev[1] - rnextcurr[1]};
+
+        // Term 1 forces
+        vertex_force_sum_t1[0] += cp[0] * Jac;
+        vertex_force_sum_t1[1] += cp[1] * Jac;
+
+        // Term 2 forces
+        vertex_force_sum_t2[0] += rhatdiff_t2[0] * Jac;
+        vertex_force_sum_t2[1] += rhatdiff_t2[1] * Jac;
+      }
+
+      F_t1[0] += elasticity_area * vertex_force_sum_t1[0];
+      F_t1[1] += elasticity_area * vertex_force_sum_t1[1];
+      F_t2[0] += elasticity_peri * vertex_force_sum_t2[0];
+      F_t2[1] += elasticity_peri * vertex_force_sum_t2[1];
+
+      double fx = -F_t1[0] - F_t2[0];
+      double fy = -F_t1[1] - F_t2[1];
+
+      f[i][0] += fx;
+      f[i][1] += fy;
+      f[i][2] += 0.0;
+    }
+  }
+
+
+  /**** Implement monte-carlo algorithm to update the network topology for next time step****/
 
   //First find the number of MC steps/iterations: N_mc = total neighs for all owned atoms accross procs/2
 
@@ -408,9 +640,10 @@ void FixTriDynamic::post_force(int vflag)
   srand(time(NULL) + me);    //random seed for each rank
 
   //Start Monte-Carlo
-  
+
   int num_swaps_rejected = 0;
-  
+  double dummy[neighs_MAX * 2];
+
   for (int n = 0; n < Num_mc_steps; n++) {
 
     //allocate memory for storing tags of cells in the Quad in this mc step and some other info
@@ -418,7 +651,7 @@ void FixTriDynamic::post_force(int vflag)
 
     int cell_i = rand() % nlocal;    //return a random integer between [0, nlocal-1]
 
-    //error check for num_neighs_celli-->behvaing a bit wierdly! when full
+    //error check for num_neighs_celli-->behaving a bit wierdly! when full
     if (num_neighs[cell_i] == 0) {
       print_neighs_list(neighs[cell_i], neighs_MAX, tag[cell_i]);
       error->one(FLERR, "no of neighs for atom is 0");
@@ -428,6 +661,11 @@ void FixTriDynamic::post_force(int vflag)
         rand() % num_neighs[cell_i];    //return a random neigh index [0, num_neighs_i - 1]
     int tmpj = atom->map(neighs[cell_i][rand_neigh_idx]);
     int cell_j = domain->closest_image(cell_i, tmpj);
+
+    //check 1
+    if (num_neighs[cell_i] <= 4 || num_neighs[cell_j] <= 4) {
+      continue;    //Not a valid candidate for swapping
+    }
 
     int comm_neigh[2] = {-1};    // array to store common pair atoms
     int num_comm_neighs = get_comm_neigh(comm_neigh, neighs[cell_i], neighs[cell_j],
@@ -441,23 +679,52 @@ void FixTriDynamic::post_force(int vflag)
       error->one(FLERR, "both the comm neighs are same-->might be due some atom added twice");
     }
 
+    //Check 2 (for num of common neighs)
+    if (num_comm_neighs != 2) { continue; }
+
     //get the local ids using closest image
     int cell_k = domain->closest_image(cell_i, atom->map(comm_neigh[0]));
     int cell_l = domain->closest_image(cell_i, atom->map(comm_neigh[1]));
+
+    //Check 3: See if the quadrialteral formed is convex or concave:
+    //i->k->j->l is the order of points of quadralteral in a cyclic manner
+
+    // //DEBUGGER
+    // cell_i = 57;
+    // cell_j = 48;
+    // cell_k = 67;
+    // cell_l = 36;
+
+    // print_neighs_list(neighs[cell_i], num_neighs[cell_i], tag[cell_i]);
+    // print_neighs_list(neighs[cell_j], num_neighs[cell_j], tag[cell_j]);
+    // print_neighs_list(neighs[cell_k], num_neighs[cell_k], tag[cell_k]);
+    // print_neighs_list(neighs[cell_l], num_neighs[cell_l], tag[cell_l]);
+    // //DEBUGGER
+
+    double p1[2] = {x[cell_i][0], x[cell_i][1]};
+    double p2[2] = {x[cell_k][0], x[cell_k][1]};
+    double p3[2] = {x[cell_j][0], x[cell_j][1]};
+    double p4[2] = {x[cell_l][0], x[cell_l][1]};
+
+    //If quadrilateral formed is concave then resultant tiling not valid
+    if (isConcave(p1, p2, p3, p4)) {
+      // //DEBUGGER
+      // printf("\n quad formed is concave, hence rejected \n");
+      // //DEBUGGER
+      continue;
+    }
 
     cell_tags[0] = tag[cell_i];
     cell_tags[1] = tag[cell_j];
     cell_tags[2] = tag[cell_k];
     cell_tags[3] = tag[cell_l];
 
+    // //DEBUGGER
+    // printf("\n Quad selected--> %d,  %d,  %d,  %d", cell_tags[0], cell_tags[1], cell_tags[2], cell_tags[3]);
+    // //DEBUGGER
+
     //a flag variable that tells whether k and l bonded or not: 1 if unbonded and 0 if bonded
     int flag_unbonded = unbonded(neighs[cell_k], num_neighs[cell_k], tag[cell_l]);
-
-    //Check for validity of bond between i and j to be swapped
-
-    if (num_comm_neighs != 2 || num_neighs[cell_i] <= 4 || num_neighs[cell_j] <= 4) {
-      continue;    //go to the next MC step and leave this bond
-    }
 
     //Store the local indices of 'owned' atoms
 
@@ -469,6 +736,10 @@ void FixTriDynamic::post_force(int vflag)
     //store energy before swap
     double E_before = cell_shape[owned_i][2] + cell_shape[owned_j][2] + cell_shape[owned_k][2] +
         cell_shape[owned_l][2];
+
+    // //Debugger
+    // printf("\n Ebefore = %f", E_before);
+    // //DEBUGGER
 
     //Attempt a bond swap--> Update neighs information first for all atoms (and their ghost images) involved
 
@@ -519,8 +790,10 @@ void FixTriDynamic::post_force(int vflag)
 
     for (int m = 0; m < 4; m++) {
       int owned_atom = atom->map(cell_tags[m]);
-      get_cell_data(array_atom[owned_atom], cell_shape[owned_atom], neighs[owned_atom],
-                    num_neighs[owned_atom], owned_atom);
+      // get_cell_data(array_atom[owned_atom], cell_shape[owned_atom], neighs[owned_atom],
+      //               num_neighs[owned_atom], owned_atom);
+      get_cell_data(dummy, cell_shape[owned_atom], neighs[owned_atom], num_neighs[owned_atom],
+                    owned_atom);
       int imj_atom = sametag[owned_atom];
       while (imj_atom != -1) {
         cell_shape[imj_atom][0] = cell_shape[owned_atom][0];
@@ -533,6 +806,10 @@ void FixTriDynamic::post_force(int vflag)
     double E_after = cell_shape[owned_i][2] + cell_shape[owned_j][2] + cell_shape[owned_k][2] +
         cell_shape[owned_l][2];
 
+    // //Debugger
+    // printf("  Eafter \n = %f", E_after);
+    // //DEBUGGER
+
     double Delta_E = E_after - E_before;
     int flag_swapped = 1;
 
@@ -540,16 +817,17 @@ void FixTriDynamic::post_force(int vflag)
 
     if (Delta_E < 0) {
       continue;
-    } 
-    else {
+    } else {
       double Prob = exp(-1.0 * Delta_E / KT);
       double rand_num = (double) rand() / RAND_MAX;    //generate a random no between 0 and 1
       if (Prob > rand_num) {
-        continue;  //accept the swap with this probability
-      } 
-      else {
+        continue;    //accept the swap with this probability
+      } else {
         flag_swapped = 0;    //swapping attempt failed as not energetically favoured
         num_swaps_rejected += 1;
+        //DEBUGGER
+        //printf("\nswapping was rejected\n");
+        //DEBUGGER
       }
     }
 
@@ -602,8 +880,10 @@ void FixTriDynamic::post_force(int vflag)
       // Again go back to original information
       for (int m = 0; m < 4; m++) {
         int owned_atom = atom->map(cell_tags[m]);
-        get_cell_data(array_atom[owned_atom], cell_shape[owned_atom], neighs[owned_atom],
-                      num_neighs[owned_atom], owned_atom);
+        // get_cell_data(array_atom[owned_atom], cell_shape[owned_atom], neighs[owned_atom],
+        //               num_neighs[owned_atom], owned_atom);
+        get_cell_data(dummy, cell_shape[owned_atom], neighs[owned_atom], num_neighs[owned_atom],
+                      owned_atom);
         int imj_atom = sametag[owned_atom];
         while (imj_atom != -1) {
           cell_shape[imj_atom][0] = cell_shape[owned_atom][0];
@@ -620,18 +900,6 @@ void FixTriDynamic::post_force(int vflag)
 
   //END OF MONTE CARLO
 
-  /****STEP 6: Again create polygonal tiling and store vertices with updated neighs list****/
-
-  /****STEP 8: Do the force calculation based on updated toplogy****/
-
-  for (int i = 0; i < nlocal; i++) {
-    if (mask[i] & groupbit) {
-      f[i][0] += 0.0;
-      f[i][1] += 0.0;
-      f[i][2] += 0.0;
-    }
-    //printf("force on cell %d is %f...%f...%f\n", tag[i], f[i][0], f[i][1], f[i][2]);
-  }
 }
 
 /* ---------------------------------------------------------------------- */
@@ -818,9 +1086,56 @@ void FixTriDynamic::remove_neigh(int celli, tagint tag_neigh, tagint *celli_neig
 void FixTriDynamic::print_neighs_list(tagint *cell_neighs, int num_cell_neighs, tagint cell)
 {
 
-  printf("\n%d--->", cell);
+  printf("\n Neighs List %d--->", cell);
   for (int n = 0; n < num_cell_neighs; n++) { printf("%d,  ", cell_neighs[n]); }
   printf("\n");
+}
+
+/*~~~~~~~~~~~~~~~~~~~ Function 7: check if the quad is convex or concave ~~~~~~~~~~~~~~~~*/
+
+bool FixTriDynamic::isConcave(double *p1, double *p2, double *p3, double *p4)
+{
+  // Compute cross products for each consecutive triplet of points
+  double cross1 = crossProduct(p1, p2, p3);
+  double cross2 = crossProduct(p2, p3, p4);
+  double cross3 = crossProduct(p3, p4, p1);
+  double cross4 = crossProduct(p4, p1, p2);
+
+  // Check if all cross products have the same sign
+  if ((cross1 > 0 && cross2 > 0 && cross3 > 0 && cross4 > 0) ||
+      (cross1 < 0 && cross2 < 0 && cross3 < 0 && cross4 < 0)) {
+    return false;    // Convex
+  }
+  return true;    // Concave
+}
+
+/*~~~~~~~~~~~~~~~~~~~ Function 8: cross product ~~~~~~~~~~~~~~~~*/
+
+double FixTriDynamic::crossProduct(double *p1, double *p2, double *p3)
+{
+  double cross = (p2[0] - p1[0]) * (p3[1] - p2[1]) - (p3[0] - p2[0]) * (p2[1] - p1[1]);
+  return cross;
+}
+
+/*~~~~~~~~~~~~~~~~~~~~~~FUnction 9: get cross product~~~~~~~~~~~~~~~~*/
+
+void FixTriDynamic::getCP(double *cp, double *v1, double *v2)
+{
+  cp[0] = v1[1] * v2[2] - v1[2] * v2[1];
+  cp[1] = v1[2] * v2[0] - v1[0] * v2[2];
+  cp[2] = v1[0] * v2[1] - v1[1] * v2[0];
+}
+
+/*~~~~~~~~~~~~~~~~~~~~~Function 10: normalize a vector*/
+
+// helper function: normalizes a vector
+
+void FixTriDynamic::normalize(double *v)
+{
+  double norm = pow(pow(v[0], 2) + pow(v[1], 2) + pow(v[2], 2), 0.5);
+  v[0] = v[0] / norm;
+  v[1] = v[1] / norm;
+  v[2] = v[2] / norm;
 }
 
 /* ---------------------------------------------------------------------- */
