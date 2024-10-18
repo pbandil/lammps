@@ -60,10 +60,10 @@ enum { NONE, CONSTANT, EQUAL, ATOM };
 /* ---------------------------------------------------------------------- */
 
 FixTriDynamic::FixTriDynamic(LAMMPS *lmp, int narg, char **arg) :
-    Fix(lmp, narg, arg), id_compute_voronoi(nullptr), cell_shape(nullptr), wgn(nullptr),
-    idregion(nullptr), region(nullptr)
+    Fix(lmp, narg, arg), id_compute_voronoi(nullptr), cell_shape(nullptr), vertices(nullptr),
+    x_updated(nullptr), wgn(nullptr), idregion(nullptr), region(nullptr)
 {
-  if (narg < 14) error->all(FLERR, "Illegal fix TriDynamic command: not sufficient args");
+  if (narg < 19) error->all(FLERR, "Illegal fix TriDynamic command: not sufficient args");
 
   MPI_Comm_rank(world, &me);
   MPI_Comm_size(world, &nprocs);
@@ -92,10 +92,15 @@ FixTriDynamic::FixTriDynamic(LAMMPS *lmp, int narg, char **arg) :
   Jv = utils::numeric(FLERR, arg[9], false, lmp);
   var = utils::numeric(FLERR, arg[10], false, lmp);
   neighs_MAX = utils::numeric(FLERR, arg[11], false, lmp);
-  gamma_R = utils::numeric(FLERR, arg[12], false, lmp);
+  eta_0 = utils::numeric(FLERR, arg[12], false, lmp);
   KT = utils::numeric(FLERR, arg[13], false, lmp);
+  n_every_output = utils::numeric(FLERR, arg[14], false, lmp);
+  Num_MC_input = utils::numeric(FLERR, arg[15], false, lmp);
+  c1 = utils::numeric(FLERR, arg[16], false, lmp);
+  c2 = utils::numeric(FLERR, arg[17], false, lmp);
+  T1_threshold = utils::numeric(FLERR, arg[18], false, lmp);
 
-  /*This fix takes in input as per-atom array
+  /*This fix takes in input a per-atom array
   produced by compute voronoi*/
 
   vcompute = modify->get_compute_by_id(id_compute_voronoi);
@@ -105,14 +110,16 @@ FixTriDynamic::FixTriDynamic(LAMMPS *lmp, int narg, char **arg) :
   //parse values for optional arguments
   nevery = 1;    // Using default value for now
 
-  if (narg > 14) {
-    idregion = utils::strdup(arg[14]);
+  if (narg > 19) {
+    idregion = utils::strdup(arg[19]);
     region = domain->get_region_by_id(idregion);
   }
 
   // Initialize nmax and virial pointer
   nmax = atom->nmax;
   cell_shape = nullptr;
+  vertices = nullptr;
+  x_updated = nullptr;
 
   // Specify attributes for dumping connectivity (neighs_array)
   // This fix generates a per-atom array with specified columns as output,
@@ -139,6 +146,8 @@ FixTriDynamic::~FixTriDynamic()
   delete wgn;
 
   memory->destroy(cell_shape);
+  memory->destroy(vertices);
+  memory->destroy(x_updated);
 
   // unregister callbacks to this fix from atom class
   if (peratom_flag) { atom->delete_callback(id, Atom::GROW); }
@@ -146,7 +155,7 @@ FixTriDynamic::~FixTriDynamic()
   if (new_fix_id && modify->nfix) modify->delete_fix(new_fix_id);
   delete[] new_fix_id;
 
-  // fclose(fp); //no writing of file is required
+  //fclose(fp); //no writing of file is required
 }
 
 /* ---------------------------------------------------------------------- */
@@ -222,6 +231,7 @@ void FixTriDynamic::setup(int vflag)
   //   }
 
   /*We only need local array for our purpose*/
+
   if (!(vcompute->invoked_flag & Compute::INVOKED_LOCAL)) {
     vcompute->compute_local();
     vcompute->invoked_flag |= Compute::INVOKED_LOCAL;
@@ -241,7 +251,7 @@ void FixTriDynamic::setup(int vflag)
     }
   }
 
-  // Populate neighs array with global ids of the voronoi neighs (initial)
+  // Populate neighs array with global ids of the voronoi neighs (initial configuration)
 
   for (int n = 0; n < num_rows_loc; n++) {
     // skip rows with neighbor ID 0 as they denote z surfaces:
@@ -267,9 +277,13 @@ void FixTriDynamic::setup(int vflag)
   /*Create memeory allocations for other per atom info*/
 
   //cell_shape array does not need to persist accross time steps for atoms that have moved accross procs
+  //same for vertices array
+  //allocate memory at once instead of every time step
 
   nmax = atom->nmax;
   memory->create(cell_shape, nmax, 3, "fix_tridynamic:cell_shape");
+  memory->create(vertices, nmax, neighs_MAX * 2, "fix_tridynamic:vertices");
+  memory->create(x_updated, nmax, 2, "fix_tridynamic:x_updated");
 
   /*Don't need this verlet or respa stuff (probably!) as long as things are going well*/
 
@@ -302,7 +316,7 @@ void FixTriDynamic::post_force(int vflag)
 {
   /*Read in current data*/
 
-  double **x = atom->x;
+  double **x = atom->x;    //This is x_n
   double **f = atom->f;
   double **v = atom->v;
   int *mask = atom->mask;
@@ -329,9 +343,9 @@ void FixTriDynamic::post_force(int vflag)
 
   /**** STEP 1: Get the neighs list and make it cyclic (CCW) ****/
 
-  tagint **neighs = atom->iarray[index];
+  tagint **neighs = atom->iarray[index];    //This is T_n
 
-  // Determine the number of neighs for all atoms (owned+ghost)
+  // Determine the number of neighs for all atoms (owned + ghost)
   // This info is required frequently so better store it instead of recomputing every time
   // Doing it for nall right now and see later if you require for nall. if not just store for nlocal
   // We need num of neighs for ghost atoms in function get_non_bonded
@@ -351,19 +365,42 @@ void FixTriDynamic::post_force(int vflag)
   // While arranging this will tell you whether a neighbor has moved out the ghost cutoff or not
   // If thrown an exception, increase the cutoff
 
-  for (int i = 0; i < nlocal; i++) { arrange_cyclic(neighs[i], num_neighs[i], i); }
+  for (int i = 0; i < nlocal; i++) { arrange_cyclic(neighs[i], num_neighs[i], i, x); }
 
   // Communicate neighs (to have ordered neighs list of ghost atoms as well)
   commflag = 2;
   comm->forward_comm(this, neighs_MAX);
+
+  // // DEBUGGER
+  // std::string file0 = "Neighs_list.txt";          // + std::to_string(0) + ".txt";
+  // std::string file1 = "Energy_montecarlo.txt";    // + std::to_string(0) + ".txt";
+  // string filenames[2] = {file0, file1};
+  // ofstream fp[2];
+
+  // // To write output to files->first create them:
+  // filenames[0] = {file0};
+  // if (update->ntimestep % n_every_output == 0) {
+  //   fp[0].open(filenames[0].c_str(), std::ios_base::app);
+  //   fp[0] << "----------- timestep: " << update->ntimestep << "--------------" << endl;
+  //   for (int i = 0; i < nlocal; i++) {
+  //     fp[0] << tag[i] << "--->";
+  //     for (int j = 0; j < num_neighs[i]; j++) { fp[0] << neighs[i][j] << ", "; }
+  //     fp[0] << endl;
+  //   }
+  //   fp[0] << endl << endl;
+  // }
+  // //DEBUGGER
 
   /**** STEP 2: Get cell shape info (area, perimeter, energy) in the current topology ****/
 
   // Possibly resize arrays
   if (atom->nmax > nmax) {
     memory->destroy(cell_shape);
+    memory->destroy(vertices);
     nmax = atom->nmax;
     memory->create(cell_shape, nmax, 3, "fix_tridynamic:cell_shape");
+    memory->create(vertices, nmax, neighs_MAX * 2, "fix_tridynamic:vertices");
+    memory->create(x_updated, nmax, 2, "fix_tridynamic:x_updated");
   }
 
   // Initialize arrays to zero
@@ -372,45 +409,42 @@ void FixTriDynamic::post_force(int vflag)
   }
 
   // Reset array-atom if outputting
+  // Initialize vertices info as well
+
   if (peratom_flag) {
     for (int i = 0; i < nlocal; i++) {
-      for (int j = 0; j < neighs_MAX * 2; j++) { array_atom[i][j] = 0.0; }
+      for (int j = 0; j < neighs_MAX * 2; j++) {
+        array_atom[i][j] = 0.0;
+        vertices[i][j] = 0.0;
+      }
     }
   }
 
-  // Store topology for outputting at current step (this is before updating the connectivity)
-  // we would still need to decide on what topology, the forces will be calculated
-  // Whether it is on current one or the updated one
-
-  // if (peratom_flag) {
-  //   for (int i = 0; i < nlocal; i++) {
-  //     for (int j = 0; j < neighs_MAX; j++) { array_atom[i][j] = neighs[i][j]; }
-  //   }
-  // }
-
-  //Calculate areas, perimeters and energy of nlocal atoms and populate array_atom with vertices
+  //Calculate areas, perimeters and energy of nlocal atoms and populate vertices array as well
 
   for (int i = 0; i < nlocal; i++) {
-    get_cell_data(array_atom[i], cell_shape[i], neighs[i], num_neighs[i], i);
+    get_cell_data(vertices[i], cell_shape[i], neighs[i], num_neighs[i],
+                  i, x);    //changed from array_atom to vertices
   }
-
-  // //DEBUGGER
-  // for (int i = 0; i < nlocal; i++){
-  //   printf("vertices for cell %d--> ", tag[i]);
-  //   for (int j = 0; j < neighs_MAX*2; j++){
-  //     printf("%f, ", array_atom[i][j]);
-  //   }
-  //   printf("\n\n");
-  // }
-  // //DEBUGGER
 
   //forward communicate the cell shape data
   commflag = 1;
   comm->forward_comm(this, 3);
 
-  /****: Do the force calculation based on current toplogy****/
+  // Store topology (xn, Tn) for outputting at the current step (this is before updating the connectivity)
+
+  // Write data for outputting and plotting
+  if (peratom_flag) {
+    for (int i = 0; i < nlocal; i++) {
+      for (int j = 0; j < neighs_MAX * 2; j++) { array_atom[i][j] = vertices[i][j]; }
+    }
+  }
+
+  /****** Find forces f_n based on x_n and T_n now *******/
 
   double Jac = 1.0 / 3.0;
+
+  double eta[nlocal] = {eta_0}; 
 
   for (int i = 0; i < nlocal; i++) {
     if (mask[i] & groupbit) {
@@ -425,116 +459,119 @@ void FixTriDynamic::post_force(int vflag)
       //Force contri from neighs
       for (int j = 0; j < num_neighs[i]; j++) {
 
-        int current_cell = domain->closest_image(i, atom->map(neighs[i][j]));   
+        int current_neigh = domain->closest_image(i, atom->map(neighs[i][j]));
 
         //coords of cell j
-        double x1 = x[current_cell][0];
-        double y1 = x[current_cell][1];
+        double x1 = x[current_neigh][0];
+        double y1 = x[current_neigh][1];
 
-        int num_neighsj = num_neighs[current_cell];
+        int num_neighsj = num_neighs[current_neigh];
 
-        int cyclic_neighsj[num_neighsj+4];
+        int cyclic_neighsj[num_neighsj + 4];
 
-        cyclic_neighsj[0] = neighs[current_cell][num_neighsj-2];
-        cyclic_neighsj[1] = neighs[current_cell][num_neighsj-1];
+        cyclic_neighsj[0] = neighs[current_neigh][num_neighsj - 2];
+        cyclic_neighsj[1] = neighs[current_neigh][num_neighsj - 1];
 
-        for (int n = 2; n < num_neighsj+2; n++){
-          cyclic_neighsj[n] = neighs[current_cell][n-2];
+        for (int n = 2; n < num_neighsj + 2; n++) {
+          cyclic_neighsj[n] = neighs[current_neigh][n - 2];
         }
 
-        cyclic_neighsj[num_neighsj+2] = neighs[current_cell][0];
-        cyclic_neighsj[num_neighsj+3] = neighs[current_cell][1];
+        cyclic_neighsj[num_neighsj + 2] = neighs[current_neigh][0];
+        cyclic_neighsj[num_neighsj + 3] = neighs[current_neigh][1];
 
         // First term values needed
-        double ai = cell_shape[current_cell][0];
-        double elasticity_area = (1 / 2.0) * (ai - 1);
+        double ai = cell_shape[current_neigh][0];
+        double elasticity_area = (1.0 / 2.0) * (ai - 1);
 
         // Second term values needed
-        double pi = cell_shape[current_cell][1];
+        double pi = cell_shape[current_neigh][1];
         double elasticity_peri = kp * (pi - p0);
 
         /*Now there are 2 vertices shared by cell i and j*/
-        //Find those two vertices:
 
-        int DT[2][3];    //each row is a triangle (local ids) and hence a vertex
-        DT[0][0] = i;
-        DT[1][0] = i;
-        DT[0][1] = current_cell;
-        DT[1][1] = current_cell;
-        int tri_prev[2][3]; 
-        int tri_next[2][3];
+        double nu[2][2] = {0.0};    //each row is a vertex and columns are nu_x and nu_y
+        double nu_prev[2][2] = {0.0};
+        double nu_next[2][2] = {0.0};
 
-        for (int n = 2; n < num_neighsj + 2; n++) {
-          if (cyclic_neighsj[n] == tag[i]) {
-            DT[0][2] = domain->closest_image(current_cell, atom->map(cyclic_neighsj[n - 1]));
-            tri_prev[0][0] = current_cell;
-            tri_prev[0][1] = DT[0][2];
-            tri_prev[0][2] = domain->closest_image(current_cell, atom->map(cyclic_neighsj[n - 2]));
-
-            tri_next[0][0] = current_cell;
-            tri_next[0][1] = i;
-            tri_next[0][2] = domain->closest_image(current_cell, atom->map(cyclic_neighsj[n + 1]));
-
-            DT[1][2] = domain->closest_image(current_cell, atom->map(cyclic_neighsj[n + 1]));
-            tri_prev[1][0] = current_cell;
-            tri_prev[1][1] = i;
-            tri_prev[1][2] = domain->closest_image(current_cell, atom->map(cyclic_neighsj[n - 1]));
-
-            tri_next[1][0] = current_cell;
-            tri_next[1][1] = DT[1][2];
-            tri_next[1][2] = domain->closest_image(current_cell, atom->map(cyclic_neighsj[n + 2]));
-            break;
+        int k = 2;
+        while (cyclic_neighsj[k] != tag[i]) {
+          k++;
+          if (k == num_neighsj + 2) {
+            error->one(FLERR,
+                       " \n Inside force code: cell j did not find cell i as its neighbor \n");
           }
         }
+
+        int cell_l = domain->closest_image(current_neigh, atom->map(cyclic_neighsj[k - 1]));
+        int cell_k = domain->closest_image(current_neigh, atom->map(cyclic_neighsj[k + 1]));
+
+        //error check
+        int cell_l_from_i = domain->closest_image(i, atom->map(cyclic_neighsj[k - 1]));
+        int cell_k_from_i = domain->closest_image(i, atom->map(cyclic_neighsj[k + 1]));
+
+        if (cell_l != cell_l_from_i || cell_k != cell_k_from_i) {
+          error->one(FLERR,
+                     "Inside force code: nearest images of common neighbors for cell i and j do "
+                     "not match");
+        }
+
+        /* for nu1 ---> (j,i,l): */
+        nu[0][0] = (x[i][0] + x[current_neigh][0] + x[cell_l][0]) / 3.0;
+        nu[0][1] = (x[i][1] + x[current_neigh][1] + x[cell_l][1]) / 3.0;
+
+        //nu1_prev ---> (j,l,n)
+        int cell_n = domain->closest_image(current_neigh, atom->map(cyclic_neighsj[k - 2]));
+        nu_prev[0][0] = (x[current_neigh][0] + x[cell_l][0] + x[cell_n][0]) / 3.0;
+        nu_prev[0][1] = (x[current_neigh][1] + x[cell_l][1] + x[cell_n][1]) / 3.0;
+
+        //nu1_next ---> (j,i,k)
+        nu_next[0][0] = (x[current_neigh][0] + x[i][0] + x[cell_k][0]) / 3.0;
+        nu_next[0][1] = (x[current_neigh][1] + x[i][1] + x[cell_k][1]) / 3.0;
+
+        /* for nu2 ---> (k,i,l) */
+        nu[1][0] = (x[i][0] + x[current_neigh][0] + x[cell_k][0]) / 3.0;
+        nu[1][1] = (x[i][1] + x[current_neigh][1] + x[cell_k][1]) / 3.0;
+
+        //nu1_prev ---> (j,i,l)
+
+        nu_prev[1][0] = (x[current_neigh][0] + x[i][0] + x[cell_l][0]) / 3.0;
+        nu_prev[1][1] = (x[current_neigh][1] + x[i][1] + x[cell_l][1]) / 3.0;
+
+        //nu1_next ---> (j,k,m)
+        int cell_m = domain->closest_image(current_neigh, atom->map(cyclic_neighsj[k + 2]));
+        nu_next[1][0] = (x[current_neigh][0] + x[cell_k][0] + x[cell_m][0]) / 3.0;
+        nu_next[1][1] = (x[current_neigh][1] + x[cell_k][1] + x[cell_m][1]) / 3.0;
 
         double vertex_force_sum_t1[2] = {0.0};
         double vertex_force_sum_t2[2] = {0.0};
 
         //Now loop through both the vertices
 
-        for (int nu = 0; nu < 2; nu++) {
-
-          //Coords of cell k
-          double x2 = x[DT[nu][2]][0];
-          double y2 = x[DT[nu][2]][1];
-          
-          //Coords of the vertex
-          double vert[2] = {0.0};
-          vert[0] = (x0 + x1 + x2) / 3.0;
-          vert[1] = (y0 + y1 + y2) / 3.0;
-
-          /*Find coords of vert_next and vert_prev*/
-
-          //Next and prev vertices for neighboring atom j
-          double vert_prev[2] = {0.0};
-          vert_prev[0] = (x[tri_prev[nu][0]][0] + x[tri_prev[nu][1]][0] + x[tri_prev[nu][2]][0]) / 3.0; 
-          vert_prev[1] = (x[tri_prev[nu][0]][1] + x[tri_prev[nu][1]][1] + x[tri_prev[nu][2]][1]) / 3.0;
-
-          double vert_next[2] = {0.0};
-          vert_next[0] = (x[tri_next[nu][0]][0] + x[tri_next[nu][1]][0] + x[tri_next[nu][2]][0]) / 3.0;
-          vert_next[1] = (x[tri_next[nu][0]][1] + x[tri_next[nu][1]][1] + x[tri_next[nu][2]][1]) / 3.0;
+        for (int n = 0; n < 2; n++) {
 
           //first term stuff
 
-          double rprevnext[3] = {vert_next[0] - vert_prev[0], vert_next[1] - vert_prev[1], 0.0};
+          double r_next_prev[3] = {nu_next[n][0] - nu_prev[n][0], nu_next[n][1] - nu_prev[n][1],
+                                   0.0};
           double cp[3] = {0.0};
           double N[3] = {0, 0, 1};    // normal vector to the plane of cell layer (2D)
-          getCP(cp, rprevnext, N);
+          getCP(cp, r_next_prev, N);
 
           //second term stuff
-          double rcurrprev[2] = {vert[0] - vert_prev[0], vert[1] - vert_prev[1]};
-          double rnextcurr[2] = {vert_next[0] - vert[0], vert_next[1] - vert[1]};
-          normalize(rcurrprev);
-          normalize(rnextcurr);
-          double rhatdiff_t2[2] = {rcurrprev[0] - rnextcurr[0], rcurrprev[1] - rnextcurr[1]};
+          double r_curr_prev[2] = {nu[n][0] - nu_prev[n][0], nu[n][1] - nu_prev[n][1]};
+          double r_next_curr[2] = {nu_next[n][0] - nu[n][0], nu_next[n][1] - nu[n][1]};
+          normalize(r_curr_prev);
+          normalize(r_next_curr);
+          double r_hatdiff_t2[2] = {r_curr_prev[0] - r_next_curr[0],
+                                    r_curr_prev[1] - r_next_curr[1]};
 
           // Term 1 forces
           vertex_force_sum_t1[0] += cp[0] * Jac;
           vertex_force_sum_t1[1] += cp[1] * Jac;
 
           // Term 2 forces
-          vertex_force_sum_t2[0] += rhatdiff_t2[0] * Jac;
-          vertex_force_sum_t2[1] += rhatdiff_t2[1] * Jac;
+          vertex_force_sum_t2[0] += r_hatdiff_t2[0] * Jac;
+          vertex_force_sum_t2[1] += r_hatdiff_t2[1] * Jac;
         }
 
         F_t1[0] += elasticity_area * vertex_force_sum_t1[0];
@@ -543,14 +580,14 @@ void FixTriDynamic::post_force(int vflag)
         F_t2[1] += elasticity_peri * vertex_force_sum_t2[1];
       }
 
-      /*Force contribution from self*/
+      /*~~~~~~~~~~~~~~~~~ Force contribution from self ~~~~~~~~~~~~~~~~~*/
 
       double vertex_force_sum_t1[2] = {0.0};
       double vertex_force_sum_t2[2] = {0.0};
 
       // First term values needed
       double ai = cell_shape[i][0];
-      double elasticity_area = (1 / 2.0) * (ai - 1);
+      double elasticity_area = (1.0 / 2.0) * (ai - 1); //ka/2
 
       // Second term values needed
       double pi = cell_shape[i][1];
@@ -560,50 +597,72 @@ void FixTriDynamic::post_force(int vflag)
       double vertices_i_x[num_neighs[i]] = {0.0};
       double vertices_i_y[num_neighs[i]] = {0.0};
 
-      for (int n = 0; n < num_neighs[i]; n++) {
-        vertices_i_x[n] = array_atom[i][2 * n];
-        vertices_i_y[n] = array_atom[i][2 * n + 1];
-      }
+      //Also find the minimum distance of cell from its bonds
+      double dist_bond;
+      double min_dist_bond = INFINITY; //initialize to infinity
+
+      int cell2, cell3;  //store the ids of neighs for which bond distance is minimum
 
       //Loop through the vertices
-
-      for (int nu = 0; nu < num_neighs[i]; nu++) {
+      for (int n = 0; n < num_neighs[i]; n++) {
         double vert[2] = {0.0};
         double vert_next[2] = {0.0};
         double vert_prev[2] = {0.0};
 
-        vert[0] = array_atom[i][2 * nu];
-        vert[1] = array_atom[i][2 * nu + 1];
+        vert[0] = vertices[i][2 * n];
+        vert[1] = vertices[i][2 * n + 1];
 
-        if (nu == 0) {
-          vert_next[0] = array_atom[i][2 * (nu + 1)];
-          vert_next[1] = array_atom[i][2 * (nu + 1) + 1];
-          vert_prev[0] = array_atom[i][2 * (num_neighs[i] - 1)];
-          vert_prev[1] = array_atom[i][2 * (num_neighs[i] - 1) + 1];
-        } else if (nu == num_neighs[i] - 1) {
-          vert_next[0] = array_atom[i][0];
-          vert_next[1] = array_atom[i][1];
-          vert_prev[0] = array_atom[i][2 * (nu - 1)];
-          vert_prev[1] = array_atom[i][2 * (nu - 1) + 1];
+        int neigh_j1 = domain->closest_image(i, atom->map(neighs[i][n])); //local id of the neigh
+        int neigh_j2;
+
+        if (n == 0) {
+          vert_next[0] = vertices[i][2 * (n + 1)];
+          vert_next[1] = vertices[i][2 * (n + 1) + 1];
+          vert_prev[0] = vertices[i][2 * (num_neighs[i] - 1)];
+          vert_prev[1] = vertices[i][2 * (num_neighs[i] - 1) + 1];
+          neigh_j2 = domain->closest_image(i, atom->map(neighs[i][1]));
+        } else if (n == num_neighs[i] - 1) {
+          vert_next[0] = vertices[i][0];
+          vert_next[1] = vertices[i][1];
+          vert_prev[0] = vertices[i][2 * (n - 1)];
+          vert_prev[1] = vertices[i][2 * (n - 1) + 1];
+          neigh_j2 = domain->closest_image(i, atom->map(neighs[i][0]));
         } else {
-          vert_next[0] = array_atom[i][2 * (nu + 1)];
-          vert_next[1] = array_atom[i][2 * (nu + 1) + 1];
-          vert_prev[0] = array_atom[i][2 * (nu - 1)];
-          vert_prev[1] = array_atom[i][2 * (nu - 1) + 1];
+          vert_next[0] = vertices[i][2 * (n + 1)];
+          vert_next[1] = vertices[i][2 * (n + 1) + 1];
+          vert_prev[0] = vertices[i][2 * (n - 1)];
+          vert_prev[1] = vertices[i][2 * (n - 1) + 1];
+          neigh_j2 = domain->closest_image(i, atom->map(neighs[i][n+1]));
+        }
+
+        //Viscosity stuff
+        double xj1[2] = {x[neigh_j1][0], x[neigh_j1][1]};
+        double xj2[2] = {x[neigh_j2][0], x[neigh_j2][1]};
+
+        double A_line = xj1[1] - xj2[1];  //A = y1-y2
+        double B_line = xj2[0] - xj1[0];  //B = x2-x1
+        double C_line = xj1[0] * xj2[1] - xj2[0] * xj1[1];  //C = x1*y2 - x2*y1
+
+        dist_bond = fabs(A_line * x[i][0] + B_line * x[i][1] + C_line) / sqrt(A_line*A_line + B_line*B_line);
+        
+        if (dist_bond < min_dist_bond){
+          min_dist_bond = dist_bond;         //update the minimum value
+          cell2 = atom->map(tag[neigh_j1]);  //store cell ids as well
+          cell3 = atom->map(tag[neigh_j2]);
         }
 
         //first term stuff
-        double rprevnext[3] = {vert_next[0] - vert_prev[0], vert_next[1] - vert_prev[1], 0.0};
+        double r_next_prev[3] = {vert_next[0] - vert_prev[0], vert_next[1] - vert_prev[1], 0.0};
         double cp[3] = {0.0};
         double N[3] = {0, 0, 1};    // normal vector to the plane of cell layer (2D)
-        getCP(cp, rprevnext, N);
+        getCP(cp, r_next_prev, N);
 
         //second term stuff
-        double rcurrprev[2] = {vert[0] - vert_prev[0], vert[1] - vert_prev[1]};
-        double rnextcurr[2] = {vert_next[0] - vert[0], vert_next[1] - vert[1]};
-        normalize(rcurrprev);
-        normalize(rnextcurr);
-        double rhatdiff_t2[2] = {rcurrprev[0] - rnextcurr[0], rcurrprev[1] - rnextcurr[1]};
+        double r_curr_prev[2] = {vert[0] - vert_prev[0], vert[1] - vert_prev[1]};
+        double r_next_curr[2] = {vert_next[0] - vert[0], vert_next[1] - vert[1]};
+        normalize(r_curr_prev);
+        normalize(r_next_curr);
+        double rhatdiff_t2[2] = {r_curr_prev[0] - r_next_curr[0], r_curr_prev[1] - r_next_curr[1]};
 
         // Term 1 forces
         vertex_force_sum_t1[0] += cp[0] * Jac;
@@ -614,37 +673,146 @@ void FixTriDynamic::post_force(int vflag)
         vertex_force_sum_t2[1] += rhatdiff_t2[1] * Jac;
       }
 
+      //Update the viscosities for celli and cell2 and cell3;
+      //Always keep the maximum viscosity
+      
+      double eta_i = eta_0*(1 + c1*exp(-1.0 * c2 * min_dist_bond));
+      
+      if (eta_i > eta[i]){
+        eta[i] = eta_i;
+      }
+
+      if (eta_i > eta[cell2]){
+        eta[cell2] = eta_i;
+      }
+
+      if (eta_i > eta[cell3]){
+        eta[cell3] = eta_i;
+      }
+
+      //vertex model forces
+
       F_t1[0] += elasticity_area * vertex_force_sum_t1[0];
       F_t1[1] += elasticity_area * vertex_force_sum_t1[1];
       F_t2[0] += elasticity_peri * vertex_force_sum_t2[0];
       F_t2[1] += elasticity_peri * vertex_force_sum_t2[1];
 
+      /*self force contri end*/
+      
+      // Add all the force contributions
       double fx = -F_t1[0] - F_t2[0];
       double fy = -F_t1[1] - F_t2[1];
 
-      f[i][0] += fx;
-      f[i][1] += fy;
-      f[i][2] += 0.0;
+      f[i][0] += fx/eta[i];
+      f[i][1] += fy/eta[i];
+      f[i][2] = 0.0;
     }
   }
 
 
-  /**** Implement monte-carlo algorithm to update the network topology for next time step****/
+  //Initialize x_updated to x_n
+
+  for (int i = 0; i < nall; i++) {
+    x_updated[i][0] = x[i][0];
+    x_updated[i][1] = x[i][1];
+  }
+
+  //Now find the updated positions x_n+1
+  //here we update the positions to ensure that T_n+1 is compatible with x_n+1
+
+  //The effect of viscosity has already been accounted for inside force
+  //Fix brownian will now effectively update positions like this
+  //This is more like the velocity now
+
+  ///////////// COMMENTING OUT for debugging purposes only ////////////////
+
+  for (int i = 0; i < nlocal; i++) {
+    x_updated[i][0] = x[i][0] + f[i][0]  * dt;
+    x_updated[i][1] = x[i][1] + f[i][1]  * dt;
+    int imj_atom = sametag[i];
+    while (imj_atom != -1) {
+      x_updated[imj_atom][0] = x[imj_atom][0] + f[i][0]  * dt;
+      x_updated[imj_atom][1] = x[imj_atom][1] + f[i][1]  * dt;
+      imj_atom = sametag[imj_atom];
+    }
+  }
+
+  ///////////// COMMENTING OUT for debugging purposes only ////////////////
+
+  
+  // Find the updated neighs list based on changed positions
+
+  tagint neighs_rearr[nlocal][neighs_MAX];
+  
+  for (int i = 0; i < nlocal; i++) {
+    for (int j = 0; j < neighs_MAX; j++) { neighs_rearr[i][j] = neighs[i][j]; }
+    //arrange them cyclically based on x_updated
+    arrange_cyclic(neighs_rearr[i], num_neighs[i], i, x_updated);
+  }
+
+  // Compare the original and rearranged neighs list to see if it is a cyclic permutation or not
+
+  for (int i = 0; i < nlocal; i++) {
+    if (is_cyclic_perm(neighs[i], neighs_rearr[i], num_neighs[i])) {
+      continue;
+    } else {
+      print_neighs_list(neighs[i], num_neighs[i], i);
+      print_neighs_list(neighs_rearr[i], num_neighs[i], i);
+      error->one(FLERR, "\n !!!! The new neighs list (after cells positions have been updated) is not a cyclic permutation of the previous one !!!! \n");
+    }
+  }
+  
+  // Now that cells have moved, tiling has changed. Update cell-shape data based on x_updated
+
+  for (int i = 0; i < nlocal; i++) {
+    get_cell_data(vertices[i], cell_shape[i], neighs[i], num_neighs[i],
+                  i, x_updated);    //changed from array_atom to vertices
+  }
+
+  // forward communicate the new cell shape data
+  commflag = 1;
+  comm->forward_comm(this, 3);
+
+  // Update neighs list (now cyclically permuted based on x_updated)
+
+  for (int i = 0; i < nlocal; i++){
+    for (int j = 0; j < neighs_MAX; j++){
+      neighs[i][j] = neighs_rearr[i][j];
+    }
+  }
+
+  // Communicate neighs (to have ordered neighs list of ghost atoms as well)
+  commflag = 2;
+  comm->forward_comm(this, neighs_MAX);
+
+ /////////////////////////////////////////////////////////////////////////////////////////////////////
+ ////////////////////////////////////////////////////////////////////////////////////////////////////
+  /*~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~MONTE CARLO / Vertex model like T1 swap~~~~~~~~~~~~~~~~~~~~
+  --> Implement monte-carlo algorithm to update the network topology for next time step
+                             i.e.  obtain T_n+1 from x_n+1 and T_n
+  --> We should think about incorporating timescale into it and relating it to physical params like p0
+  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~***/
+ /////////////////////////////////////////////////////////////////////////////////////////////////////
+ ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+   /*%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%*/
+  /*We now need to ensure that x_n+1 and T_n+1 are compatible
+  /*%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%*/
 
   //First find the number of MC steps/iterations: N_mc = total neighs for all owned atoms accross procs/2
 
-  int Num_neighs_this = 0;    //local value
-  for (int i = 0; i < nlocal; i++) { Num_neighs_this += num_neighs[i]; }
+  int Num_neighs = 0;    //local value
+  for (int i = 0; i < nlocal; i++) { Num_neighs += num_neighs[i]; }
 
-  int Num_mc_steps = Num_neighs_this / 2;
+  int Num_MC_bonds = Num_neighs /
+      2;    //This says that the number of MC steps will be the same as number of bonds in the configuration.
   srand(time(NULL) + me);    //random seed for each rank
 
   //Start Monte-Carlo
 
   int num_swaps_rejected = 0;
-  double dummy[neighs_MAX * 2];
 
-  for (int n = 0; n < Num_mc_steps; n++) {
+  for (int n = 0; n < Num_MC_bonds; n++) {
 
     //allocate memory for storing tags of cells in the Quad in this mc step and some other info
     tagint cell_tags[4] = {0};
@@ -653,111 +821,158 @@ void FixTriDynamic::post_force(int vflag)
 
     //error check for num_neighs_celli-->behaving a bit wierdly! when full
     if (num_neighs[cell_i] == 0) {
-      print_neighs_list(neighs[cell_i], neighs_MAX, tag[cell_i]);
+      //print_neighs_list(neighs[cell_i], neighs_MAX, tag[cell_i]);
       error->one(FLERR, "no of neighs for atom is 0");
     }
 
-    int rand_neigh_idx =
-        rand() % num_neighs[cell_i];    //return a random neigh index [0, num_neighs_i - 1]
-    int tmpj = atom->map(neighs[cell_i][rand_neigh_idx]);
-    int cell_j = domain->closest_image(cell_i, tmpj);
+    //return a random neigh index [0, num_neighs_i - 1]
+    int rand_neigh_idx = rand() % num_neighs[cell_i];
+    int cell_j = atom->map(neighs[cell_i][rand_neigh_idx]);    //we need the owned atom id of cell_j
 
-    //check 1
+    //CHECK 1 ---> No of neighs for a cell should not fall below 4
     if (num_neighs[cell_i] <= 4 || num_neighs[cell_j] <= 4) {
       continue;    //Not a valid candidate for swapping
     }
 
-    int comm_neigh[2] = {-1};    // array to store common pair atoms
-    int num_comm_neighs = get_comm_neigh(comm_neigh, neighs[cell_i], neighs[cell_j],
-                                         num_neighs[cell_i], num_neighs[cell_j]);
+    tagint comm_neigh_ij[2] = {-1};    // array to store common pair atoms
+    int num_comm_neighs_ij = get_comm_neigh(comm_neigh_ij, neighs[cell_i], neighs[cell_j],
+                                            num_neighs[cell_i], num_neighs[cell_j]);
 
-    // Error check for comm_neighs
-    if (comm_neigh[0] == comm_neigh[1]) {
-      printf("\n %d and %d\n", comm_neigh[0], comm_neigh[1]);
-      print_neighs_list(neighs[cell_i], num_neighs[cell_i], tag[cell_i]);
-      print_neighs_list(neighs[cell_j], num_neighs[cell_j], tag[cell_j]);
-      error->one(FLERR, "both the comm neighs are same-->might be due some atom added twice");
+    //CHECK 2 --> Two bonded atoms (i and j) should have exactly two distinct common neighs
+    if (num_comm_neighs_ij != 2) {
+      //print_neighs_list(neighs[cell_i], num_neighs[cell_i], tag[cell_i]);
+      //print_neighs_list(neighs[cell_j], num_neighs[cell_j], tag[cell_j]);
+      error->one(
+          FLERR,
+          " \n No of common neighs between bonded atoms (i and j) not exactly 2 --> probably some "
+          "problem in swapping , This could also happen if there is a triangular cell involved\n");
     }
 
-    //Check 2 (for num of common neighs)
-    if (num_comm_neighs != 2) { continue; }
-
-    //get the local ids using closest image
-    int cell_k = domain->closest_image(cell_i, atom->map(comm_neigh[0]));
-    int cell_l = domain->closest_image(cell_i, atom->map(comm_neigh[1]));
-
-    //Check 3: See if the quadrialteral formed is convex or concave:
-    //i->k->j->l is the order of points of quadralteral in a cyclic manner
-
-    // //DEBUGGER
-    // cell_i = 57;
-    // cell_j = 48;
-    // cell_k = 67;
-    // cell_l = 36;
-
-    // print_neighs_list(neighs[cell_i], num_neighs[cell_i], tag[cell_i]);
-    // print_neighs_list(neighs[cell_j], num_neighs[cell_j], tag[cell_j]);
-    // print_neighs_list(neighs[cell_k], num_neighs[cell_k], tag[cell_k]);
-    // print_neighs_list(neighs[cell_l], num_neighs[cell_l], tag[cell_l]);
-    // //DEBUGGER
-
-    double p1[2] = {x[cell_i][0], x[cell_i][1]};
-    double p2[2] = {x[cell_k][0], x[cell_k][1]};
-    double p3[2] = {x[cell_j][0], x[cell_j][1]};
-    double p4[2] = {x[cell_l][0], x[cell_l][1]};
-
-    //If quadrilateral formed is concave then resultant tiling not valid
-    if (isConcave(p1, p2, p3, p4)) {
-      // //DEBUGGER
-      // printf("\n quad formed is concave, hence rejected \n");
-      // //DEBUGGER
-      continue;
+    if (comm_neigh_ij[0] == comm_neigh_ij[1]) {
+      error->one(FLERR,
+                 " \n Both the comm neighs of i and j are same --> might be due to some atom added "
+                 "twice \n");
     }
+
+    //If common neighs for cell i and j are exactly 2 and distinct then continue
+
+    //this gives the ids of the owned images of the neighboring cells of cell i (and j)
+    int cell_k = atom->map(comm_neigh_ij[0]);
+    int cell_l = atom->map(comm_neigh_ij[1]);
+
+    //all cell_i,j,k,l are 'local' ids at this point
 
     cell_tags[0] = tag[cell_i];
     cell_tags[1] = tag[cell_j];
     cell_tags[2] = tag[cell_k];
     cell_tags[3] = tag[cell_l];
 
-    // //DEBUGGER
-    // printf("\n Quad selected--> %d,  %d,  %d,  %d", cell_tags[0], cell_tags[1], cell_tags[2], cell_tags[3]);
-    // //DEBUGGER
+    //Find the nearest images of cells from cell_i (now based on updated positions)
 
-    //a flag variable that tells whether k and l bonded or not: 1 if unbonded and 0 if bonded
+    int cell_j_nearest = nearest_image(cell_i, cell_j, x_updated);
+    int cell_k_nearest = nearest_image(cell_i, cell_k, x_updated);
+    int cell_l_nearest = nearest_image(cell_i, cell_l, x_updated);
+
+    //CHECK 3 --> Get the correct images of cells and their neighbors
+
+    int flag_valid_imj = 0;
+
+    int closest_imj_of_l_from_k = nearest_image(cell_k, cell_l, x_updated);
+    int closest_imj_of_k_from_l = nearest_image(cell_l, cell_k, x_updated);
+
+    if (cell_k_nearest == cell_k &&
+        cell_l_nearest == cell_l) {    // if k and l are owned then the nearest images must coincide
+      if (cell_k_nearest == closest_imj_of_k_from_l && cell_l_nearest == closest_imj_of_l_from_k) {
+        flag_valid_imj = 1;    //swapping allowed as nearest images coincide
+      }
+    } else if (cell_k_nearest != cell_k &&
+               cell_l_nearest !=
+                   cell_l) {    //if both k and l are ghost then nearest images must be different
+      if (cell_k_nearest != closest_imj_of_k_from_l && cell_l_nearest != closest_imj_of_l_from_k) {
+        flag_valid_imj = 1;    //swapping allowed as nearest images don't coincide
+      }
+    } else if (cell_k_nearest == cell_k &&
+               cell_l_nearest != cell_l) {    //if k is owned and l is ghost
+      if (cell_l_nearest == closest_imj_of_l_from_k && cell_k_nearest != closest_imj_of_k_from_l) {
+        flag_valid_imj = 1;
+      }
+    } else if (cell_k_nearest != cell_k && cell_l_nearest == cell_l) {
+      if (cell_k_nearest == closest_imj_of_k_from_l && cell_l_nearest != closest_imj_of_l_from_k) {
+        flag_valid_imj = 1;
+      }
+    }
+
+    if (flag_valid_imj == 0) {
+      continue;    //not a valid swap
+    }
+
+    //CHECK 4 --> see if cell_k and cell_l are (1.) non-bonded and (2.) have exactly two common neighs
+
     int flag_unbonded = unbonded(neighs[cell_k], num_neighs[cell_k], tag[cell_l]);
+    tagint comm_neigh_kl[2] = {-1};    // array to store common pair atoms
+    int num_comm_neighs_kl = get_comm_neigh(comm_neigh_kl, neighs[cell_k], neighs[cell_l],
+                                            num_neighs[cell_k], num_neighs[cell_l]);
 
-    //Store the local indices of 'owned' atoms
+    if (num_comm_neighs_kl != 2) {
+      // error->one(FLERR,
+      //            "\n No of common neighs between cells k and l not exactly 2 --> some problem in "
+      //            "swapping \n");
+      continue;
+    }
 
-    int owned_i = atom->map(cell_tags[0]);
-    int owned_j = atom->map(cell_tags[1]);
-    int owned_k = atom->map(cell_tags[2]);
-    int owned_l = atom->map(cell_tags[3]);
+    //CHECK 5: Edge length must be smaller than some threshold
+    
+    double nu1_x = (x_updated[cell_i][0] + x_updated[cell_j_nearest][0] + x_updated[cell_k_nearest][0]) / 3.0;
+    double nu1_y = (x_updated[cell_i][1] + x_updated[cell_j_nearest][1] + x_updated[cell_k_nearest][1]) / 3.0;
+    double nu2_x = (x_updated[cell_i][0] + x_updated[cell_j_nearest][0] + x_updated[cell_l_nearest][0]) / 3.0;
+    double nu2_y = (x_updated[cell_i][1] + x_updated[cell_j_nearest][1] + x_updated[cell_l_nearest][1]) / 3.0; 
+
+    double edge_length = sqrt((nu2_x - nu1_x)*(nu2_x - nu1_x) + (nu2_y - nu1_y)*(nu2_y - nu1_y));
+
+    if (edge_length > T1_threshold){
+      continue;
+    }
+
+    //CHECK 6 --> See if the quadrialteral formed is convex or concave:
+    //i->k->j->l is the order of points of quadralteral in a cyclic manner
+
+    double p1[2] = {x_updated[cell_i][0], x_updated[cell_i][1]};
+    double p2[2] = {x_updated[cell_k_nearest][0], x_updated[cell_k_nearest][1]};
+    double p3[2] = {x_updated[cell_j_nearest][0], x_updated[cell_j_nearest][1]};
+    double p4[2] = {x_updated[cell_l_nearest][0], x_updated[cell_l_nearest][1]};
+
+    //If quadrilateral formed is concave then resultant tiling not valid
+    if (isConcave(p1, p2, p3, p4)) {
+      continue;
+    }
+
+    /*********All check completed ---> Attempt the swapping***********/
 
     //store energy before swap
-    double E_before = cell_shape[owned_i][2] + cell_shape[owned_j][2] + cell_shape[owned_k][2] +
-        cell_shape[owned_l][2];
+    double E_before = cell_shape[cell_i][2] + cell_shape[cell_j][2] + cell_shape[cell_k][2] +
+        cell_shape[cell_l][2];
 
-    // //Debugger
-    // printf("\n Ebefore = %f", E_before);
-    // //DEBUGGER
-
-    //Attempt a bond swap--> Update neighs information first for all atoms (and their ghost images) involved
+    //Attempt a bond swap--> Update neighs information first for all owned atoms (and their ghost images) involved
 
     //Delete bond
     for (int m = 0; m < 2; m++) {
       int owned_atom = atom->map(cell_tags[m]);
-      int imj_atom = owned_atom;
       tagint neigh_tag;
       if (m == 0) {
         neigh_tag = cell_tags[1];
       } else if (m == 1) {
         neigh_tag = cell_tags[0];
       }
+      //First update info on owned atom
+      remove_neigh(owned_atom, neigh_tag, neighs[owned_atom], num_neighs[owned_atom], neighs_MAX);
+      num_neighs[owned_atom] -= 1;
+      if (num_neighs[owned_atom] == 3) { error->one(FLERR, "number of neighs fell below 4"); }
+      arrange_cyclic(neighs[owned_atom], num_neighs[owned_atom], owned_atom, x_updated);
+      //Now update info on its ghost images
+      int imj_atom = sametag[owned_atom];
       while (imj_atom != -1) {
-        remove_neigh(imj_atom, neigh_tag, neighs[imj_atom], num_neighs[imj_atom], neighs_MAX);
-        num_neighs[imj_atom] -= 1;
-        if (num_neighs[imj_atom] == 3) { error->one(FLERR, "number of neighs fell below 4"); }
-        arrange_cyclic(neighs[imj_atom], num_neighs[imj_atom], imj_atom);
+        for (int ii = 0; ii < neighs_MAX; ii++) { neighs[imj_atom][ii] = neighs[owned_atom][ii]; }
+        num_neighs[imj_atom] = num_neighs[owned_atom];
         imj_atom = sametag[imj_atom];
       }
     }
@@ -766,34 +981,88 @@ void FixTriDynamic::post_force(int vflag)
     if (flag_unbonded == 1) {
       for (int m = 2; m < 4; m++) {
         int owned_atom = atom->map(cell_tags[m]);
-        int imj_atom = owned_atom;
         tagint neigh_tag;
         if (m == 2) {
           neigh_tag = cell_tags[3];
         } else if (m == 3) {
           neigh_tag = cell_tags[2];
         }
+        //Update info of owned atom
+        neighs[owned_atom][num_neighs[owned_atom]] = neigh_tag;
+        num_neighs[owned_atom] += 1;
+        if (num_neighs[owned_atom] == neighs_MAX) {
+          printf("\n Limit reached for adding new neighs to atom %d\n", tag[owned_atom]);
+          error->one(FLERR, "EXITED");
+        }
+        arrange_cyclic(neighs[owned_atom], num_neighs[owned_atom], owned_atom, x_updated);
+        //Now update info on ghost images
+        int imj_atom = sametag[owned_atom];
         while (imj_atom != -1) {
-          neighs[imj_atom][num_neighs[imj_atom]] = neigh_tag;
-          num_neighs[imj_atom] += 1;
-          if (num_neighs[imj_atom] == neighs_MAX) {
-            printf("\n Limit reached for adding new neighs to atom %d\n", tag[imj_atom]);
-            error->one(FLERR, "EXITED");
-          }
-          arrange_cyclic(neighs[imj_atom], num_neighs[imj_atom], imj_atom);
+          for (int ii = 0; ii < neighs_MAX; ii++) { neighs[imj_atom][ii] = neighs[owned_atom][ii]; }
+          num_neighs[imj_atom] = num_neighs[owned_atom];
           imj_atom = sametag[imj_atom];
         }
       }
     }
 
+    // Check if the swap results in valid triangulation or not
+
+    int flag_valid_tri = 1;
+
+    for (int i = 0; i < 4; i++) {
+      int cell = atom->map(cell_tags[i]);
+      int num_neighs_cell = num_neighs[cell];
+      int neigh_prev, neigh_next;
+      for (int j = 0; j < num_neighs_cell; j++) {
+        int curr_neigh = atom->map(neighs[cell][j]);    //local id
+        if (j == 0) {
+          neigh_prev = neighs[cell][num_neighs_cell - 1];
+          neigh_next = neighs[cell][j + 1];
+        } else if (j == num_neighs_cell - 1) {
+          neigh_prev = neighs[cell][j - 1];
+          neigh_next = neighs[cell][0];
+        } else {
+          neigh_prev = neighs[cell][j - 1];
+          neigh_next = neighs[cell][j + 1];
+        }
+        //check the previous and next atoms for the current neigh j
+        int num_neighs_curr = num_neighs[curr_neigh];
+        int neigh_prev_curr, neigh_next_curr;
+        int jj = 0;
+        while (tag[cell] != neighs[curr_neigh][jj]) {
+          jj++;
+          // error check
+          if (jj == num_neighs_curr) {
+            error->one(FLERR, "\n tag[cell] not found in the neighs list of curr neigh \n");
+          }
+          //error check
+        }
+        if (jj == 0) {
+          neigh_prev_curr = neighs[curr_neigh][num_neighs_curr - 1];
+          neigh_next_curr = neighs[curr_neigh][jj + 1];
+        } else if (jj == num_neighs_curr - 1) {
+          neigh_prev_curr = neighs[curr_neigh][jj - 1];
+          neigh_next_curr = neighs[curr_neigh][0];
+        } else {
+          neigh_prev_curr = neighs[curr_neigh][jj - 1];
+          neigh_next_curr = neighs[curr_neigh][jj + 1];
+        }
+        if (neigh_prev != neigh_next_curr || neigh_next != neigh_prev_curr) {
+          flag_valid_tri = 0;
+          break;
+        }
+      }
+      if (flag_valid_tri == 0) { break; }
+    }
+
+    int flag_energy_crit = 1;    //for energy criteria
+
     //Now get the cell_shape data for all atoms and compute energy after swap
 
     for (int m = 0; m < 4; m++) {
       int owned_atom = atom->map(cell_tags[m]);
-      // get_cell_data(array_atom[owned_atom], cell_shape[owned_atom], neighs[owned_atom],
-      //               num_neighs[owned_atom], owned_atom);
-      get_cell_data(dummy, cell_shape[owned_atom], neighs[owned_atom], num_neighs[owned_atom],
-                    owned_atom);
+      get_cell_data(vertices[owned_atom], cell_shape[owned_atom], neighs[owned_atom],
+                        num_neighs[owned_atom], owned_atom, x_updated);
       int imj_atom = sametag[owned_atom];
       while (imj_atom != -1) {
         cell_shape[imj_atom][0] = cell_shape[owned_atom][0];
@@ -803,35 +1072,42 @@ void FixTriDynamic::post_force(int vflag)
       }
     }
 
-    double E_after = cell_shape[owned_i][2] + cell_shape[owned_j][2] + cell_shape[owned_k][2] +
-        cell_shape[owned_l][2];
-
-    // //Debugger
-    // printf("  Eafter \n = %f", E_after);
-    // //DEBUGGER
+    double E_after = cell_shape[cell_i][2] + cell_shape[cell_j][2] + cell_shape[cell_k][2] +
+        cell_shape[cell_l][2];
 
     double Delta_E = E_after - E_before;
-    int flag_swapped = 1;
 
-    //Metropolis scheme
-
-    if (Delta_E < 0) {
-      continue;
-    } else {
-      double Prob = exp(-1.0 * Delta_E / KT);
-      double rand_num = (double) rand() / RAND_MAX;    //generate a random no between 0 and 1
-      if (Prob > rand_num) {
-        continue;    //accept the swap with this probability
+    if (flag_valid_tri == 1) {
+      //Metropolis scheme
+      if (Delta_E < 0) {
+        // //DEBUGGER
+        // E_MC_n = E_MC_n + Delta_E;   //update energy at this MC step
+        // fp[1] << n+1 << "  " << E_MC_n << endl;
+        // //DEBUGGER
+        continue;
       } else {
-        flag_swapped = 0;    //swapping attempt failed as not energetically favoured
-        num_swaps_rejected += 1;
-        //DEBUGGER
-        //printf("\nswapping was rejected\n");
-        //DEBUGGER
+        double Prob = exp(-1.0 * Delta_E / KT);
+        double rand_num = (double) rand() / RAND_MAX;    //generate a random no between 0 and 1
+        if (Prob > rand_num) {
+          // //DEBUGGER
+          // E_MC_n = E_MC_n + Delta_E;  //Update energy at this MC step
+          // fp[1] << n+1 << "  " << E_MC_n << endl;
+          // //DEBUGGER
+          continue;    //accept the swap with this probability
+        } else {
+          flag_energy_crit = 0;    //swapping attempt failed as not energetically favoured
+          num_swaps_rejected += 1;
+        }
       }
     }
 
-    if (flag_swapped == 0) {
+    //Reverse swapping if not fulfilled all the criteria
+
+    if (flag_energy_crit == 0 || flag_valid_tri == 0) {
+
+      // //DEBUGGER
+      //   fp[1] << n+1 << "  " << E_MC_n << endl;
+      // //DEBUGGER
 
       cell_tags[0] = tag[cell_k];
       cell_tags[1] = tag[cell_l];
@@ -840,39 +1116,55 @@ void FixTriDynamic::post_force(int vflag)
 
       //First delete bond between atom k and l (only if they were previously unbonded)
       if (flag_unbonded == 1) {
+        //Delete bond
         for (int m = 0; m < 2; m++) {
           int owned_atom = atom->map(cell_tags[m]);
-          int imj_atom = owned_atom;
           tagint neigh_tag;
           if (m == 0) {
             neigh_tag = cell_tags[1];
           } else if (m == 1) {
             neigh_tag = cell_tags[0];
           }
+          //First update info on owned atom
+          remove_neigh(owned_atom, neigh_tag, neighs[owned_atom], num_neighs[owned_atom],
+                       neighs_MAX);
+          num_neighs[owned_atom] -= 1;
+          if (num_neighs[owned_atom] == 3) { error->one(FLERR, "number of neighs fell below 4"); }
+          arrange_cyclic(neighs[owned_atom], num_neighs[owned_atom], owned_atom, x_updated);
+          //Now update info on its ghost images
+          int imj_atom = sametag[owned_atom];
           while (imj_atom != -1) {
-            remove_neigh(imj_atom, neigh_tag, neighs[imj_atom], num_neighs[imj_atom], neighs_MAX);
-            num_neighs[imj_atom] -= 1;
-            arrange_cyclic(neighs[imj_atom], num_neighs[imj_atom], imj_atom);
+            for (int ii = 0; ii < neighs_MAX; ii++) {
+              neighs[imj_atom][ii] = neighs[owned_atom][ii];
+            }
+            num_neighs[imj_atom] = num_neighs[owned_atom];
             imj_atom = sametag[imj_atom];
           }
         }
       }
 
       //Then Create bond between i and j
-
       for (int m = 2; m < 4; m++) {
         int owned_atom = atom->map(cell_tags[m]);
-        int imj_atom = owned_atom;
         tagint neigh_tag;
         if (m == 2) {
           neigh_tag = cell_tags[3];
         } else if (m == 3) {
           neigh_tag = cell_tags[2];
         }
+        //Update info of owned atom
+        neighs[owned_atom][num_neighs[owned_atom]] = neigh_tag;
+        num_neighs[owned_atom] += 1;
+        if (num_neighs[owned_atom] == neighs_MAX) {
+          printf("\n Limit reached for adding new neighs to atom %d\n", tag[owned_atom]);
+          error->one(FLERR, "EXITED");
+        }
+        arrange_cyclic(neighs[owned_atom], num_neighs[owned_atom], owned_atom, x_updated);
+        //Now update info on ghost images
+        int imj_atom = sametag[owned_atom];
         while (imj_atom != -1) {
-          neighs[imj_atom][num_neighs[imj_atom]] = neigh_tag;
-          num_neighs[imj_atom] += 1;
-          arrange_cyclic(neighs[imj_atom], num_neighs[imj_atom], imj_atom);
+          for (int ii = 0; ii < neighs_MAX; ii++) { neighs[imj_atom][ii] = neighs[owned_atom][ii]; }
+          num_neighs[imj_atom] = num_neighs[owned_atom];
           imj_atom = sametag[imj_atom];
         }
       }
@@ -880,10 +1172,8 @@ void FixTriDynamic::post_force(int vflag)
       // Again go back to original information
       for (int m = 0; m < 4; m++) {
         int owned_atom = atom->map(cell_tags[m]);
-        // get_cell_data(array_atom[owned_atom], cell_shape[owned_atom], neighs[owned_atom],
-        //               num_neighs[owned_atom], owned_atom);
-        get_cell_data(dummy, cell_shape[owned_atom], neighs[owned_atom], num_neighs[owned_atom],
-                      owned_atom);
+        get_cell_data(vertices[owned_atom], cell_shape[owned_atom], neighs[owned_atom],
+                      num_neighs[owned_atom], owned_atom, x_updated);
         int imj_atom = sametag[owned_atom];
         while (imj_atom != -1) {
           cell_shape[imj_atom][0] = cell_shape[owned_atom][0];
@@ -895,10 +1185,14 @@ void FixTriDynamic::post_force(int vflag)
     }
   }
 
-  commflag = 2;
-  comm->forward_comm(this, neighs_MAX);
+  /*We have made sure that ghost atoms info is correct so don't need communication now 
+  Might help save some time and make code a bit faster*/
 
-  //END OF MONTE CARLO
+  // // DEBUGGER
+  // fp[1] << endl << endl;
+  // // DEBUGGER
+
+  /*~~~~~~~~~~~~~~~~~~~~~~ END OF MONTE CARLO ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~*/
 
 }
 
@@ -906,12 +1200,41 @@ void FixTriDynamic::post_force(int vflag)
 /*<<<<<<<<<<<<<<<<<<<<<< HELPER FUNCTIONS (BEGIN) >>>>>>>>>>>>>>>>>>>>>>>>>*/
 /* ---------------------------------------------------------------------- */
 
-/*~~~~~~~~~~~~~~~~~~~ FUNCTION 1: Order the neighboring cells in CCW manner ~~~~~~~~~~~~~~~~*/
+/*~~~~~~~~~~~~~~ FUNCTION 1: Finding the nearest image of cell j to cell i
+                         (we need to use our own x_pos) ~~~~~~~~~~~~~~~~*/
 
-void FixTriDynamic::arrange_cyclic(tagint *celli_neighs, int num_faces, int icell)
+int FixTriDynamic::nearest_image(int i, int j, double **x_pos)
 {
 
-  double **x = atom->x;
+  if (j < 0) return j;
+
+  int *sametag = atom->sametag;
+  int nearest = j;
+  double delx = x_pos[i][0] - x_pos[j][0];
+  double dely = x_pos[i][1] - x_pos[j][1];
+  double rsqmin = delx * delx + dely * dely;
+  double rsq;
+
+  while (sametag[j] >= 0) {
+    j = sametag[j];
+    delx = x_pos[i][0] - x_pos[j][0];
+    dely = x_pos[i][1] - x_pos[j][1];
+    rsq = delx * delx + dely * dely;
+    if (rsq < rsqmin) {
+      rsqmin = rsq;
+      nearest = j;
+    }
+  }
+
+  return nearest;
+}
+
+/*~~~~~~~~~~~~~~ FUNCTION 2: New arrange_cyclic for different position of atoms x_pos
+                  (we need to use our own x_pos) ~~~~~~~~~~~~~~~~*/
+
+void FixTriDynamic::arrange_cyclic(tagint *celli_neighs, int num_faces, int icell,
+                                       double **x_pos)
+{
   tagint *tag = atom->tag;
 
   // Calculate angle for all points
@@ -938,12 +1261,23 @@ void FixTriDynamic::arrange_cyclic(tagint *celli_neighs, int num_faces, int icel
       error->one(FLERR, "EXITED");
     }
 
-    //No errors detected--> move ahead
+    //No errors detected --> move ahead
 
-    int k = domain->closest_image(icell, ktmp);
-    theta[j] = atan2(x[k][1] - x[icell][1], x[k][0] - x[icell][0]);
+    int k = nearest_image(icell, ktmp, x_pos);
+    theta[j] = atan2(x_pos[k][1] - x_pos[icell][1], x_pos[k][0] - x_pos[icell][0]);
 
-    if (isnan(theta[j])) { error->one(FLERR, "theta j in arrange cyclic function returned nan"); }
+    if (isnan(theta[j])) {
+      printf("current time step: %ld\n", update->ntimestep);
+      printf("Cell (global): %d and neighbor (global): %d, neighbor (local): %d, closest "
+             "image(local): %d\n",
+             tag[icell], celli_neighs[j], ktmp, k);
+      double slope = (x_pos[k][1] - x_pos[icell][1]) / (x_pos[k][0] - x_pos[icell][0]);
+      printf(
+          " coords of i ---> (%f, %f), coords of k ---> (%f, %f),  slope ---> %f, atan2 ---> %f\n",
+          x_pos[icell][0], x_pos[icell][1], x_pos[k][0], x_pos[k][1], slope,
+          atan2(x_pos[k][1] - x_pos[icell][1], x_pos[k][0] - x_pos[icell][0]));
+      error->one(FLERR, "theta j in arrange cyclic function returned nan");
+    }
 
     // indices array for sorting
     indices[j] = j;
@@ -963,14 +1297,12 @@ void FixTriDynamic::arrange_cyclic(tagint *celli_neighs, int num_faces, int icel
   for (int j = 0; j < num_faces; j++) { celli_neighs[j] = celli_neighs_sorted[j]; }
 }
 
-/*~~~~~~~~~~~~~~~~~~~Function 2: Find cell polygon area, peri and energy~~~~~~~~~~~~~~~~*/
+/*~~~~~~~~~~~~~~~~~~~~~~~~~ FUNCTION 3 Find cell polygon area, peri and energy based on your own positions*/
 
-void FixTriDynamic::get_cell_data(double *celli_vertices, double *celli_geom, tagint *celli_neighs,
-                                  int num_faces, int icell)
+void FixTriDynamic::get_cell_data(double *celli_vertices, double *celli_geom,
+                                      tagint *celli_neighs, int num_faces, int icell,
+                                      double **x_pos)
 {
-
-  // Pointer to atom positions
-  double **x = atom->x;
   tagint *tag = atom->tag;
 
   // Coordinates of the vertices
@@ -987,14 +1319,14 @@ void FixTriDynamic::get_cell_data(double *celli_vertices, double *celli_geom, ta
     if (mu2 == num_faces) { mu2 = 0; }
 
     // local id of mu1
-    int j_mu1 = domain->closest_image(icell, atom->map(celli_neighs[mu1]));
+    int j_mu1 = nearest_image(icell, atom->map(celli_neighs[mu1]), x_pos);
 
     // local id of mu2
-    int j_mu2 = domain->closest_image(icell, atom->map(celli_neighs[mu2]));
+    int j_mu2 = nearest_image(icell, atom->map(celli_neighs[mu2]), x_pos);
 
     // Coordinates of current triangulation
-    double xn[3] = {x[icell][0], x[j_mu1][0], x[j_mu2][0]};
-    double yn[3] = {x[icell][1], x[j_mu1][1], x[j_mu2][1]};
+    double xn[3] = {x_pos[icell][0], x_pos[j_mu1][0], x_pos[j_mu2][0]};
+    double yn[3] = {x_pos[icell][1], x_pos[j_mu1][1], x_pos[j_mu2][1]};
 
     // Find centroid
     vert[n][0] = (xn[0] + xn[1] + xn[2]) / 3.0;
@@ -1004,7 +1336,7 @@ void FixTriDynamic::get_cell_data(double *celli_vertices, double *celli_geom, ta
     celli_vertices[2 * n + 1] = vert[n][1];
   }
 
-  double area = 0.0;
+  double area = 0.0; 
   double peri = 0.0;
 
   for (int n = 0; n < num_faces; n++) {
@@ -1026,20 +1358,52 @@ void FixTriDynamic::get_cell_data(double *celli_vertices, double *celli_geom, ta
   celli_geom[2] = 0.5 * pow((area - 1), 2.0) + 0.5 * kp * pow((peri - p0), 2.0);
 }
 
+/*~~~~~~~~~~~~~~ FUNCTION 4: See if one list is cyclic permutation of other or not ~~~~~~~~~~~~~~~~*/
+
+bool FixTriDynamic::is_cyclic_perm(tagint *original, tagint *rearranged, int num_of_neighs)
+{
+
+  tagint rearranged_concat[num_of_neighs * 2];
+
+  //Fill in the rearranged_concat list
+
+  for (int i = 0; i < num_of_neighs; i++) {
+    rearranged_concat[i] = rearranged[i];
+    rearranged_concat[i + num_of_neighs] = rearranged[i];
+  }
+
+  //find the location where first element of OG list is found
+  int idx;
+
+  for (int i = 0; i < num_of_neighs; i++) {
+    if (rearranged_concat[i] == original[0]) {
+      idx = i;
+      break;
+    }
+  }
+
+  // Now see if the original list is a sublist of concatenated list or not
+  for (int i = 0; i < num_of_neighs; i++) {
+    if (original[i] != rearranged_concat[idx + i]) { return false; }
+  }
+
+  return true;
+}
+
 /*~~~~~~~~~~~~~~~~~~~Function 3: Get common neighs for chosen bonded pair of atoms~~~~~~~~~~~~~~~~*/
 
-int FixTriDynamic::get_comm_neigh(int *common_neighs, tagint *celli_neighs, tagint *cellj_neighs,
-                                  int num_celli_neighs, int num_cellj_neighs)
+int FixTriDynamic::get_comm_neigh(tagint *common_neighs, tagint *cella_neighs, tagint *cellb_neighs,
+                                  int num_cella_neighs, int num_cellb_neighs)
 {
 
   int num_comm = 0;
 
-  for (int n = 0; n < num_celli_neighs; n++) {
-    for (int m = 0; m < num_cellj_neighs; m++) {
-      if (celli_neighs[n] == cellj_neighs[m]) {
+  for (int n = 0; n < num_cella_neighs; n++) {
+    for (int m = 0; m < num_cellb_neighs; m++) {
+      if (cella_neighs[n] == cellb_neighs[m]) {
         num_comm += 1;
         if (num_comm == 3) { return num_comm; }
-        common_neighs[num_comm - 1] = celli_neighs[n];
+        common_neighs[num_comm - 1] = cella_neighs[n];
       }
     }
   }
@@ -1049,10 +1413,10 @@ int FixTriDynamic::get_comm_neigh(int *common_neighs, tagint *celli_neighs, tagi
 
 /*~~~~~~~~~~~~~~~~~~~ Function 4: see if cells k and l are already bonded or not ~~~~~~~~~~~~~~~~*/
 
-int FixTriDynamic::unbonded(tagint *cellk_neighs, int num_cellk_neighs, tagint tag_cell_l)
+int FixTriDynamic::unbonded(tagint *cell_neighs, int num_cell_neighs, tagint tag_neigh)
 {
-  for (int n = 0; n < num_cellk_neighs; n++) {
-    if (cellk_neighs[n] == tag_cell_l) { return 0; }
+  for (int n = 0; n < num_cell_neighs; n++) {
+    if (cell_neighs[n] == tag_neigh) { return 0; }
   }
   return 1;
 }
@@ -1083,10 +1447,9 @@ void FixTriDynamic::remove_neigh(int celli, tagint tag_neigh, tagint *celli_neig
 
 /*~~~~~~~~~~~~~~~~~~~ Function 6: Print neighs list as required ~~~~~~~~~~~~~~~~*/
 
-void FixTriDynamic::print_neighs_list(tagint *cell_neighs, int num_cell_neighs, tagint cell)
+void FixTriDynamic::print_neighs_list(tagint *cell_neighs, int num_cell_neighs, int cell)
 {
-
-  printf("\n Neighs List %d--->", cell);
+  printf("Neighs List for local %d (global %d)--->", cell, atom->tag[cell]);
   for (int n = 0; n < num_cell_neighs; n++) { printf("%d,  ", cell_neighs[n]); }
   printf("\n");
 }
@@ -1126,7 +1489,7 @@ void FixTriDynamic::getCP(double *cp, double *v1, double *v2)
   cp[2] = v1[0] * v2[1] - v1[1] * v2[0];
 }
 
-/*~~~~~~~~~~~~~~~~~~~~~Function 10: normalize a vector*/
+/*~~~~~~~~~~~~~~~~~~~~~Function 10: normalize a vector~~~~~~~~~~~*/
 
 // helper function: normalizes a vector
 

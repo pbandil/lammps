@@ -50,7 +50,7 @@ class FixTriDynamic : public Fix {
   void set_arrays(int) override;
   double memory_usage() override;
 
-  //FILE *fp;  //no need to file
+  FILE *fp;  //write data for debugging
 
  protected:
   int me, nprocs;
@@ -66,10 +66,18 @@ class FixTriDynamic : public Fix {
 
   // To store area, peri and energy (these don't need to persist accross time steps)
   double **cell_shape;    //Note that these are dynamic arrays
-
+  double **vertices;
+  double **x_updated;
+  
   //Force calculation: self prpelled dynamic triangulation forces
-  double kp, p0;
-  double Jv, Jn, Js, fa, var, gamma_R, KT;
+  double ka, kp, p0;
+  double Jv, Jn, Js, fa, var, eta_0, KT;
+  double Num_MC_input;
+  double c1,c2;
+  double T1_threshold;
+
+  //For debugging purposes
+  int n_every_output;
 
   class RanMars *wgn;
   int seed_wgn;
@@ -89,14 +97,17 @@ class FixTriDynamic : public Fix {
 
   //Declare functions
   
+  //functions for checking compatibility of position and topology
+  int nearest_image(int, int, double **);
+
   // For cyclically arranging a set of points
-  void arrange_cyclic(tagint *, int, int);
+  void arrange_cyclic(tagint *, int, int, double **);
 
   // For storing cell info: area, peri and energy
-  void get_cell_data(double *, double *, tagint *, int, int);
+  void get_cell_data(double *, double *, tagint *, int, int, double **);
 
   // For obtaining common neighs for a pair of atoms
-  int get_comm_neigh(int *, tagint *, tagint *, int, int);
+  int get_comm_neigh(tagint *, tagint *, tagint *, int, int);
 
   // See if atoms are already bonded or not
 
@@ -106,12 +117,18 @@ class FixTriDynamic : public Fix {
   //void add_neigh(int, tagint, tagint *, int);
   void remove_neigh(int, tagint, tagint *, int, int);
 
-  void print_neighs_list(tagint *, int, tagint);
+  void print_neighs_list(tagint *, int, int);
 
   bool isConcave(double *, double *, double *, double *);
   double crossProduct(double *, double *, double *);
   void getCP(double *, double *, double *);
   void normalize(double *);
+  
+
+  //void arrange_cyclic_new(tagint *, int, int, double **);
+  bool is_cyclic_perm(tagint *, tagint *, int);
+
+  //int check_bond(int, int, tagint *, tagint *, int, int);
 
   //vector<vector<int>> find_triangles(tagint **, int);
 };

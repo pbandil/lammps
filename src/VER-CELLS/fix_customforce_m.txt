@@ -1045,44 +1045,44 @@ void FixCustomForce::post_force(int vflag)
 
   // Data for plotting:
 
-  // double Thetai;
-  // double Ci, normi, normj, Cij, dotprod;
-  // for(int i = 0; i < nlocal; i++){
-  //   // printf("cell %d (%d)\n", tag[i], i);
-  //   normi = getnorm(v[i]);                         // this is the magnitude of velocity i
-  //   if(normi == 0)     
-  //   {
-  //     Ci = 10;               // any value outside[-1,1]
-  //     Thetai = -1;           // any value outside [0,PI]
-  //   }
-  //   else{
-  //     int size = getsize_fromDT(rowsdt,del_tri_index,i);
-  //     int neighs_array[size];
-  //     getneighs_fromDT(rowsdt,del_tri_index,i,neighs_array);
-  //     Ci = 0.0;
-  //     for(int j = 0; j < size; j++){
-  //       int current_cell = atom->map(tag[neighs_array[j]]);
-  //       dotprod = getDP(v[current_cell],v[i]);
-  //       normj = getnorm(v[current_cell]);
-  //       if(normj == 0) 
-  //       {
-  //         Cij = 0.0;
-  //         size=size-1;              // No affect/influence of this atom on the motion of atom i
-  //       }
-  //       else Cij = dotprod/(normi*normj);
-  //       // printf("cell: %d (%d), dp: %f, normi: %f, normj: %f, factor: %f\n", 
-  //       //        tag[current_cell], current_cell, dotprod, normi, normj, factor);
-  //       Ci += Cij;      
-  //     }
-  //     Ci = Ci / size;                   // range should be [-1, 1]
-  //     Thetai = acos(v[i][0]/normi);     // range should be [0, PI] 
-  //   }
-  //   fp[0] << tag[i] << " " << Ci << endl;
-  //   fp[1] << tag[i] << " " << Thetai << endl;
-  // }
+  double Thetai;
+  double Ci, normi, normj, Cij, dotprod;
+  for(int i = 0; i < nlocal; i++){
+    // printf("cell %d (%d)\n", tag[i], i);
+    normi = getnorm(v[i]);                         // this is the magnitude of velocity i
+    if(normi == 0)     
+    {
+      Ci = 10;               // any value outside[-1,1]
+      Thetai = -1;           // any value outside [0,PI]
+    }
+    else{
+      int size = getsize_fromDT(rowsdt,del_tri_index,i);
+      int neighs_array[size];
+      getneighs_fromDT(rowsdt,del_tri_index,i,neighs_array);
+      Ci = 0.0;
+      for(int j = 0; j < size; j++){
+        int current_cell = atom->map(tag[neighs_array[j]]);
+        dotprod = getDP(v[current_cell],v[i]);
+        normj = getnorm(v[current_cell]);
+        if(normj == 0) 
+        {
+          Cij = 0.0;
+          size=size-1;              // No affect/influence of this atom on the motion of atom i
+        }
+        else Cij = dotprod/(normi*normj);
+        // printf("cell: %d (%d), dp: %f, normi: %f, normj: %f, factor: %f\n", 
+        //        tag[current_cell], current_cell, dotprod, normi, normj, factor);
+        Ci += Cij;      
+      }
+      Ci = Ci / size;                   // range should be [-1, 1]
+      Thetai = acos(v[i][0]/normi);     // range should be [0, PI] 
+    }
+    fp[0] << tag[i] << " " << Ci << endl;
+    fp[1] << tag[i] << " " << Thetai << endl;
+  }
 
-  // fp[0] << endl;
-  // fp[1] << endl;
+  fp[0] << endl;
+  fp[1] << endl;
 
   // Derive and plot the post processing for cell 
 }
